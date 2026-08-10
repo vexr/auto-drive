@@ -7,7 +7,7 @@ import {
   afterEach,
 } from '@jest/globals'
 import {
-  fetchRecentSwaps,
+  fetchRecentSwapsFrom,
   resolveEndpoint,
   RECENT_SWAPS_QUERY,
 } from '../../../src/infrastructure/services/priceOracle/subgraph.js'
@@ -38,6 +38,11 @@ const swap = (amount0: string, amount1: string, timestamp = '1785917567') => ({
   amount0,
   amount1,
 })
+
+// An explicit endpoint, so nothing here depends on what happens to be in .env.
+const ENDPOINT = { url: 'https://subgraph.test/query', apiKey: 'test-key' }
+
+const fetchSwaps = (limit: number) => fetchRecentSwapsFrom(ENDPOINT, limit)
 
 const respondWith = (
   body: unknown,
@@ -76,7 +81,7 @@ describe('priceOracle/subgraph', () => {
         },
       })
 
-      return fetchRecentSwaps(10).then((result) => {
+      return fetchSwaps(10).then((result) => {
         expect(fetchMock).toHaveBeenCalledTimes(1)
         expect(result.samples).toEqual([
           {
@@ -97,7 +102,7 @@ describe('priceOracle/subgraph', () => {
         },
       })
 
-      const { samples } = await fetchRecentSwaps(10)
+      const { samples } = await fetchSwaps(10)
 
       expect(samples).toHaveLength(2)
       expect(samples[0]).toEqual(samples[1])
@@ -113,7 +118,7 @@ describe('priceOracle/subgraph', () => {
         },
       })
 
-      const { samples } = await fetchRecentSwaps(10)
+      const { samples } = await fetchSwaps(10)
 
       // 0.4 base units truncates to 0, which makes the leg unusable and the
       // sample is dropped rather than priced at zero.
@@ -129,7 +134,7 @@ describe('priceOracle/subgraph', () => {
         },
       })
 
-      const { samples } = await fetchRecentSwaps(10)
+      const { samples } = await fetchSwaps(10)
 
       expect(samples).toHaveLength(1)
     })
@@ -143,7 +148,7 @@ describe('priceOracle/subgraph', () => {
         },
       })
 
-      const result = await fetchRecentSwaps(10)
+      const result = await fetchSwaps(10)
 
       expect(result.indexerBlock).toBe(25_725_462n)
       expect(result.indexerTimestampMs).toBe(1_786_375_343_000)
@@ -166,7 +171,7 @@ describe('priceOracle/subgraph', () => {
         },
       })
 
-      await expect(fetchRecentSwaps(10)).rejects.toThrow(
+      await expect(fetchSwaps(10)).rejects.toThrow(
         /ordered the other way round/,
       )
     })
@@ -183,13 +188,13 @@ describe('priceOracle/subgraph', () => {
         },
       })
 
-      await expect(fetchRecentSwaps(10)).rejects.toThrow(/decimals=9/)
+      await expect(fetchSwaps(10)).rejects.toThrow(/decimals=9/)
     })
 
     it('rejects a subgraph that does not have the pool', async () => {
       respondWith({ data: { _meta: meta(), pool: null, swaps: [] } })
 
-      await expect(fetchRecentSwaps(10)).rejects.toThrow(
+      await expect(fetchSwaps(10)).rejects.toThrow(
         new RegExp(`no pool ${POOL_ID}`),
       )
     })
@@ -199,13 +204,13 @@ describe('priceOracle/subgraph', () => {
     it('surfaces an HTTP failure with its status', async () => {
       respondWith({ message: 'rate limited' }, { ok: false, status: 429 })
 
-      await expect(fetchRecentSwaps(10)).rejects.toThrow(/HTTP 429/)
+      await expect(fetchSwaps(10)).rejects.toThrow(/HTTP 429/)
     })
 
     it('surfaces GraphQL errors', async () => {
       respondWith({ errors: [{ message: 'indexers failed' }] })
 
-      await expect(fetchRecentSwaps(10)).rejects.toThrow(/indexers failed/)
+      await expect(fetchSwaps(10)).rejects.toThrow(/indexers failed/)
     })
 
     it('refuses a null block timestamp rather than reading it as zero', async () => {
@@ -223,13 +228,13 @@ describe('priceOracle/subgraph', () => {
         },
       })
 
-      await expect(fetchRecentSwaps(10)).rejects.toThrow(/no block timestamp/)
+      await expect(fetchSwaps(10)).rejects.toThrow(/no block timestamp/)
     })
 
     it('refuses a response with no swaps collection', async () => {
       respondWith({ data: { _meta: meta(), pool: pool() } })
 
-      await expect(fetchRecentSwaps(10)).rejects.toThrow(/no swaps collection/)
+      await expect(fetchSwaps(10)).rejects.toThrow(/no swaps collection/)
     })
   })
 
@@ -261,7 +266,7 @@ describe('priceOracle/subgraph', () => {
         data: { _meta: meta(), pool: pool(), swaps: [] },
       })
 
-      await fetchRecentSwaps(7)
+      await fetchSwaps(7)
 
       const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
       expect(JSON.parse(init.body as string)).toEqual({

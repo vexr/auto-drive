@@ -127,10 +127,12 @@ const toBaseUnits = (amount: string, decimals: number): bigint =>
  * a test double needs no credential, and demanding a dummy one would make the
  * documented override unusable for the thing it exists for.
  */
+export type SubgraphEndpoint = { url: string; apiKey?: string }
+
 export const resolveEndpoint = (
   override: string | undefined,
   apiKey: string | undefined,
-): { url: string; apiKey?: string } => {
+): SubgraphEndpoint => {
   if (!override && !apiKey) {
     throw new Error(
       'GRAPH_API_KEY is not set — the AI3/USD oracle cannot query the pool ' +
@@ -169,21 +171,22 @@ const assertPoolIdentity = (
 }
 
 /**
- * Fetch the most recent `limit` swaps for the pool.
+ * Fetch the most recent `limit` swaps for the pool from a given endpoint.
  *
  * Throws on anything that makes the response unusable — transport failure,
  * GraphQL errors, a missing or mismatched pool, an unparseable amount. The
  * caller turns that into an oracle outage; there is no partially usable window.
+ *
+ * Takes the endpoint rather than resolving one, so that everything below can be
+ * exercised without an environment. `config` snapshots env at import: a suite
+ * that resolved its own endpoint would pass on a developer machine holding a
+ * key in .env and fail in CI, which is precisely how this seam came to exist.
  */
-export const fetchRecentSwaps = async (
+export const fetchRecentSwapsFrom = async (
+  { url, apiKey }: SubgraphEndpoint,
   limit: number,
   signal?: AbortSignal,
 ): Promise<SwapWindowResponse> => {
-  const { url, apiKey } = resolveEndpoint(
-    config.priceOracle.subgraphUrl,
-    config.priceOracle.graphApiKey,
-  )
-
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -262,3 +265,18 @@ export const fetchRecentSwaps = async (
     hasIndexingErrors: body.data._meta.hasIndexingErrors,
   }
 }
+
+// The one line that reads configuration, kept thin so everything it wraps stays
+// testable without one.
+export const fetchRecentSwaps = (
+  limit: number,
+  signal?: AbortSignal,
+): Promise<SwapWindowResponse> =>
+  fetchRecentSwapsFrom(
+    resolveEndpoint(
+      config.priceOracle.subgraphUrl,
+      config.priceOracle.graphApiKey,
+    ),
+    limit,
+    signal,
+  )
