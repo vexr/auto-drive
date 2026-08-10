@@ -207,10 +207,30 @@ describe('priceOracle/subgraph', () => {
       await expect(fetchSwaps(10)).rejects.toThrow(/HTTP 429/)
     })
 
-    it('surfaces GraphQL errors', async () => {
+    it('surfaces GraphQL errors when no data came with them', async () => {
       respondWith({ errors: [{ message: 'indexers failed' }] })
 
       await expect(fetchSwaps(10)).rejects.toThrow(/indexers failed/)
+    })
+
+    it('treats an indexing error riding alongside data as an indexing error', async () => {
+      // graph-node's own tests pin this shape: "With `allow`, the error remains
+      // but the data is included". Throwing on the errors array would report
+      // every indexing failure as a gateway outage and make the `indexer-error`
+      // reason unreachable from a real response.
+      respondWith({
+        data: {
+          _meta: meta({ hasIndexingErrors: false }),
+          pool: pool(),
+          swaps: [swap('1000.5', '-6.4032')],
+        },
+        errors: [{ message: 'indexing_error' }],
+      })
+
+      const result = await fetchSwaps(10)
+
+      expect(result.hasIndexingErrors).toBe(true)
+      expect(result.samples).toHaveLength(1)
     })
 
     it('refuses a null block timestamp rather than reading it as zero', async () => {

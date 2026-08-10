@@ -210,16 +210,31 @@ export const fetchRecentSwapsFrom = async (
   }
 
   const body = (await response.json()) as GraphResponse
-  if (body.errors?.length) {
-    throw new Error(
-      `Subgraph query returned errors: ${body.errors
-        .map((e) => e.message)
-        .join('; ')
-        .slice(0, 300)}`,
-    )
-  }
+  const errors = body.errors ?? []
+
+  // Errors are NOT automatically fatal, and the order here is the whole point.
+  //
+  // Under `subgraphError: allow`, graph-node returns the data it has AND an
+  // entry in `errors` — its own test suite pins this: "With `allow`, the error
+  // remains but the data is included", against `{"message": "indexing_error"}`.
+  // Throwing on any `errors` would therefore report every indexing failure as a
+  // gateway outage and make the `indexer-error` reason unreachable, which is
+  // exactly the diagnosis an operator needs to tell "The Graph is broken" from
+  // "we cannot reach The Graph".
+  //
+  // So the presence of usable data decides. No data means the query itself
+  // failed — a validation error, a timeout, indexers giving up — and that is an
+  // outage. Data present means the errors accompanying it are the indexing kind,
+  // and the window is refused downstream with the reason that names them.
   if (!body.data?._meta) {
-    throw new Error('Subgraph query returned no indexing metadata')
+    throw new Error(
+      errors.length
+        ? `Subgraph query returned errors: ${errors
+            .map((e) => e.message)
+            .join('; ')
+            .slice(0, 300)}`
+        : 'Subgraph query returned no indexing metadata',
+    )
   }
   const indexerTimestamp = body.data._meta.block.timestamp
   if (typeof indexerTimestamp !== 'number') {
@@ -262,7 +277,11 @@ export const fetchRecentSwapsFrom = async (
     samples,
     indexerBlock: BigInt(body.data._meta.block.number),
     indexerTimestampMs: indexerTimestamp * 1000,
-    hasIndexingErrors: body.data._meta.hasIndexingErrors,
+    // Either signal counts. `hasIndexingErrors` is the deployment's own record
+    // of past failures, while an error riding alongside the data is this
+    // response saying it is incomplete right now — and a response that had to
+    // be served under `allow` is not one to price a charge from either way.
+    hasIndexingErrors: body.data._meta.hasIndexingErrors || errors.length > 0,
   }
 }
 
