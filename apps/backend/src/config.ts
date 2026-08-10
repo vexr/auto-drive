@@ -250,6 +250,19 @@ export const config = {
     // can be perfectly well-formed and still describe a market that has since
     // stopped trading. Default: 24 hours.
     maxSwapAgeMs: positiveIntEnv('ORACLE_MAX_SWAP_AGE_MS', 86400000),
+    // Oldest a fill may be and still count toward the average. This is the
+    // window's LOWER bound, and it is what stops a majority of ancient fills
+    // from carrying the median — at which point the trim would discard the
+    // recent ones as outliers and the rate would come from another era.
+    // Default: 7 days, chosen against this pool's ~1.6 swaps/day so a full
+    // 10-swap window can normally be assembled inside it.
+    maxWindowAgeMs: positiveIntEnv('ORACLE_MAX_WINDOW_AGE_MS', 604800000),
+    // Least time the surviving fills must span. The outlier trim is count-based,
+    // so whoever supplies most of the window sets the price; requiring the
+    // window to have been HELD across time is what makes that expensive, since
+    // it must be defended against everyone else trading in between.
+    // Default: 2 hours.
+    minWindowSpanMs: positiveIntEnv('ORACLE_MIN_WINDOW_SPAN_MS', 7200000),
     // Refuse to quote when the indexer's own head is older than this. Distinct
     // from the swap-age guard on purpose — an indexer that has stalled and a
     // pool that has gone quiet look identical in the data and need different

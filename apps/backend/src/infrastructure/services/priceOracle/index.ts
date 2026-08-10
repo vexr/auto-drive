@@ -157,7 +157,9 @@ const buildWindow = async (): Promise<
     )
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    return err(unavailable(`could not read the subgraph: ${message}`, 'gateway'))
+    return err(
+      unavailable(`could not read the subgraph: ${message}`, 'gateway'),
+    )
   }
 
   const now = Date.now()
@@ -173,11 +175,7 @@ const buildWindow = async (): Promise<
   }
 
   if (
-    !isFresh(
-      response.indexerTimestampMs,
-      now,
-      config.priceOracle.maxIndexLagMs,
-    )
+    !isFresh(response.indexerTimestampMs, now, config.priceOracle.maxIndexLagMs)
   ) {
     const lagMs = now - response.indexerTimestampMs
     return err(
@@ -190,21 +188,36 @@ const buildWindow = async (): Promise<
     )
   }
 
-  const samples = response.samples
-  if (samples.length < config.priceOracle.minSwapSamples) {
+  // Two age bounds, because they answer two different questions.
+  //
+  // The window bound comes first and is a filter, not a refusal: a fill older
+  // than this may not VOTE. Without it the window has no lower bound at all,
+  // and a majority of ancient fills would carry the median — at which point the
+  // trim discards the recent ones as outliers and the oracle serves a price
+  // from another era. The bound has to be a filter rather than a check on the
+  // oldest sample, or one stale fill would deny an otherwise live window.
+  const inWindow = response.samples.filter((sample) =>
+    isFresh(sample.timestampMs, now, config.priceOracle.maxWindowAgeMs),
+  )
+  if (inWindow.length < config.priceOracle.minSwapSamples) {
     return err(
       unavailable(
-        `the pool has only ${samples.length} usable recent swaps, below the ` +
-          `floor of ${config.priceOracle.minSwapSamples}`,
+        `only ${inWindow.length} of ${response.samples.length} recent swaps ` +
+          `fall within the ${Math.round(
+            config.priceOracle.maxWindowAgeMs / 86_400_000,
+          )}d window, below the floor of ` +
+          `${config.priceOracle.minSwapSamples}`,
         'insufficient-samples',
       ),
     )
   }
 
-  const newestSwapMs = Math.max(...samples.map((s) => s.timestampMs))
-  const oldestSwapMs = Math.min(...samples.map((s) => s.timestampMs))
-  if (!isFresh(newestSwapMs, now, config.priceOracle.maxSwapAgeMs)) {
-    const ageMs = now - newestSwapMs
+  // The freshness bound then asks whether the market is alive NOW. A window can
+  // be full of fills that all sit inside the window bound and still describe a
+  // market that stopped days ago.
+  const windowNewestMs = Math.max(...inWindow.map((s) => s.timestampMs))
+  if (!isFresh(windowNewestMs, now, config.priceOracle.maxSwapAgeMs)) {
+    const ageMs = now - windowNewestMs
     return err(
       unavailable(
         `the most recent swap is ${Math.round(ageMs / 3_600_000)}h old, past ` +
@@ -215,15 +228,43 @@ const buildWindow = async (): Promise<
     )
   }
 
-  const { kept, dropped } = trimOutliers(samples, maxSwapDeviationBps)
+  const { kept, dropped } = trimOutliers(inWindow, maxSwapDeviationBps)
   if (kept.length < config.priceOracle.minSwapSamples) {
     return err(
       unavailable(
-        `${dropped} of ${samples.length} swaps deviated past ` +
+        `${dropped} of ${inWindow.length} swaps deviated past ` +
           `${config.priceOracle.maxSwapDeviationPercent}% from the window ` +
           `median, leaving ${kept.length} — below the floor of ` +
           `${config.priceOracle.minSwapSamples}`,
         'insufficient-samples',
+      ),
+    )
+  }
+
+  // Every field from here describes the SURVIVING fills, so the span reported
+  // to an operator belongs to the same set as the count and the volume.
+  const newestSwapMs = Math.max(...kept.map((s) => s.timestampMs))
+  const oldestSwapMs = Math.min(...kept.map((s) => s.timestampMs))
+
+  // The trim's median is count-based, so whoever supplies most of the window
+  // sets the price — and on a pool this thin that is a handful of fills. Volume
+  // alone does not stop it: an attacker who clears the volume floor with their
+  // own trades clears it with trades priced wherever they like.
+  //
+  // Time is the scarce thing they cannot fake. Six fills in one block are
+  // something anyone can print on demand; the same six spread across hours must
+  // be defended against everyone else trading in between, and it gives the
+  // balance alerting a window to fire in. This is the guard that turns the
+  // attack from mispricing into cost.
+  const spanMs = newestSwapMs - oldestSwapMs
+  if (spanMs < config.priceOracle.minWindowSpanMs) {
+    return err(
+      unavailable(
+        `the ${kept.length} surviving swaps span only ` +
+          `${Math.round(spanMs / 60_000)}min, under the ` +
+          `${Math.round(config.priceOracle.minWindowSpanMs / 60_000)}min ` +
+          'minimum — a burst of fills is not a market that held a price',
+        'narrow-window',
       ),
     )
   }
@@ -304,7 +345,26 @@ const serveStaleOrError = (
 const refresh = async (): Promise<
   Result<OraclePrice, OracleUnavailableError>
 > => {
-  const window = await internal.buildWindow()
+  // buildWindow returns a Result for everything it anticipates, but the
+  // statistics it calls throw on inputs that should be impossible (a zero AI3
+  // leg, an empty window). "Should be impossible" is a property of the adapter,
+  // asserted across a module boundary — so it is contained here rather than
+  // trusted. Without this, a violated invariant would reject `getPrice()`
+  // instead of returning a typed error, and every concurrent caller sharing the
+  // in-flight promise would get an unhandled rejection.
+  let window: Awaited<ReturnType<typeof buildWindow>>
+  try {
+    window = await internal.buildWindow()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    logger.error(error, 'Price oracle: unexpected failure building the window')
+    window = err(
+      unavailable(
+        `unexpected failure building the window (${message})`,
+        'gateway',
+      ),
+    )
+  }
   // Throttle the next upstream attempt regardless of outcome, so a degraded
   // source is retried at most once per cacheTtlMs instead of on every request.
   nextAttemptAt = Date.now() + config.priceOracle.cacheTtlMs

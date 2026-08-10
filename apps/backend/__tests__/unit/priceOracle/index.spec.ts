@@ -33,9 +33,9 @@ const swapsAt = (
   Array.from({ length: count }, (_, i) => ({
     usdcAmount,
     ai3Amount: AI3_PER_SWAP,
-    // Spread backwards an hour apart, so `newest` is the one at timestampMs.
+    // Spread backwards an hour apart, so `newest` is the one at timestampMs and
+    // the window clears the 2h minimum span.
     timestampMs: timestampMs - i * 3_600_000,
-    blockNumber: BLOCK - BigInt(i) * 300n,
   }))
 
 const windowAt = (
@@ -94,13 +94,11 @@ describe('priceOracle.getPrice', () => {
           usdcAmount: 350_000n, // 0.35 USDC
           ai3Amount: 50n * 10n ** 18n, // 50 AI3 -> 0.007 USD/AI3
           timestampMs: now - 60_000 - i * 3_600_000,
-          blockNumber: BLOCK - BigInt(i),
         })),
         {
           usdcAmount: 3_200_000_000n, // 3200 USDC
           ai3Amount: 500_000n * 10n ** 18n, // 500k AI3 -> 0.0064
           timestampMs: now - 60_000,
-          blockNumber: BLOCK,
         },
       ],
     }))
@@ -125,13 +123,11 @@ describe('priceOracle.getPrice', () => {
           usdcAmount: 500_000n, // 0.5 USDC
           ai3Amount: 50n * 10n ** 18n, // 50 AI3 -> 0.01 USD/AI3
           timestampMs: now - 60_000 - i * 3_600_000,
-          blockNumber: BLOCK - BigInt(i),
         })),
         {
           usdcAmount: 3_200_000_000n,
           ai3Amount: 500_000n * 10n ** 18n, // 0.0064, 1000x the volume
           timestampMs: now - 60_000,
-          blockNumber: BLOCK,
         },
       ],
     }))
@@ -269,10 +265,49 @@ describe('priceOracle.getPrice', () => {
       expect(await refusalReason()).toBe('stale-window')
     })
 
+    it('does not let ancient fills carry the median and price the window', async () => {
+      // The regression this guards: eight fills from long ago at 0.02, two from
+      // today at 0.0064. Without a lower bound the eight are the median, the
+      // trim discards TODAY's fills as outliers, and a rate from another era is
+      // served and charged. The window bound drops them first, leaving two —
+      // below the floor, so the oracle refuses.
+      mockWindow((now) => ({
+        ...windowAt(now),
+        samples: [
+          ...swapsAt(2, now - 60_000),
+          ...Array.from({ length: 8 }, (_, i) => ({
+            usdcAmount: 1_000_000_000n,
+            ai3Amount: 50_000n * 10n ** 18n, // 0.02 USD/AI3
+            timestampMs: now - 30 * 86_400_000 - i * 3_600_000,
+          })),
+        ],
+      }))
+
+      expect(await refusalReason()).toBe('insufficient-samples')
+    })
+
+    it('refuses a burst of fills that never held a price', async () => {
+      // Six fills inside ten minutes: enough of them, enough volume, all fresh —
+      // and printable on demand by anyone willing to trade against themselves.
+      mockWindow((now) => ({
+        ...windowAt(now),
+        samples: Array.from({ length: 6 }, (_, i) => ({
+          usdcAmount: USDC_PER_SWAP,
+          ai3Amount: AI3_PER_SWAP,
+          timestampMs: now - 60_000 - i * 120_000, // 2 min apart
+        })),
+      }))
+
+      expect(await refusalReason()).toBe('narrow-window')
+    })
+
     it('judges freshness on the newest swap, not the window span', async () => {
       // Five swaps an hour apart: the oldest is 5h back, well inside the bound,
       // and the window is served.
-      mockWindow((now) => ({ ...windowAt(now), samples: swapsAt(5, now - 1000) }))
+      mockWindow((now) => ({
+        ...windowAt(now),
+        samples: swapsAt(5, now - 1000),
+      }))
 
       const result = await priceOracle.getPrice()
 

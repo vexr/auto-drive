@@ -23,7 +23,6 @@ const swap = (usdc: number, ai3: number, overrides: Partial<SwapSample> = {}) =>
     usdcAmount: BigInt(Math.round(usdc * 1e6)),
     ai3Amount: BigInt(Math.round(ai3 * 1e6)) * 10n ** 12n,
     timestampMs: 1_700_000_000_000,
-    blockNumber: 21_000_000n,
     ...overrides,
   }) satisfies SwapSample
 
@@ -177,7 +176,10 @@ describe('priceOracle/quote', () => {
     })
 
     it('reports an empty window without throwing', () => {
-      expect(trimOutliers([], maxDeviationBps)).toEqual({ kept: [], dropped: 0 })
+      expect(trimOutliers([], maxDeviationBps)).toEqual({
+        kept: [],
+        dropped: 0,
+      })
     })
   })
 
@@ -218,7 +220,9 @@ describe('priceOracle/quote', () => {
 
   describe('windowVolumeUsdc', () => {
     it('sums the USDC legs', () => {
-      expect(windowVolumeUsdc([swap(6.4, 1000), swap(3.6, 500)])).toBe(10n * USDC)
+      expect(windowVolumeUsdc([swap(6.4, 1000), swap(3.6, 500)])).toBe(
+        10n * USDC,
+      )
     })
 
     it('is zero for an empty window', () => {

@@ -16,12 +16,11 @@
  */
 
 import { config } from '../../../config.js'
+import { AI3_DECIMALS, USDC_DECIMALS } from '../../../shared/utils/index.js'
 import {
   POOL_ID,
   USDC_ADDRESS,
-  USDC_DECIMALS,
   WAI3_ADDRESS,
-  WAI3_DECIMALS,
   defaultSubgraphUrl,
 } from './pool.js'
 import { parseDecimalToScaledBigint } from './quote.js'
@@ -57,7 +56,7 @@ export const RECENT_SWAPS_QUERY = `
       }
       hasIndexingErrors
     }
-    pool(id: $pool) {
+    pool(id: $pool, subgraphError: allow) {
       token0 {
         id
         decimals
@@ -72,14 +71,12 @@ export const RECENT_SWAPS_QUERY = `
       orderBy: timestamp
       orderDirection: desc
       where: { pool: $pool }
+      subgraphError: allow
     ) {
       id
       timestamp
       amount0
       amount1
-      transaction {
-        blockNumber
-      }
     }
   }
 `
@@ -89,13 +86,16 @@ type GraphSwap = {
   timestamp: string
   amount0: string
   amount1: string
-  transaction: { blockNumber: string } | null
 }
 
 type GraphResponse = {
   data?: {
     _meta: {
-      block: { number: number; timestamp: number }
+      // `timestamp` is NULLABLE in graph-node's schema (`_Block_`), so it is
+      // typed as such here and validated below rather than trusted: read as a
+      // number it would silently become 0, and every read would then refuse
+      // with "the indexer is 1.7 billion seconds behind".
+      block: { number: number; timestamp: number | null }
       hasIndexingErrors: boolean
     } | null
     pool: {
@@ -114,22 +114,38 @@ type GraphResponse = {
 const toBaseUnits = (amount: string, decimals: number): bigint =>
   parseDecimalToScaledBigint(amount.trim().replace(/^-/, ''), decimals)
 
-const requireEndpoint = (): { url: string; apiKey: string } => {
-  const apiKey = config.priceOracle.graphApiKey
-  if (!apiKey) {
+/**
+ * Where to send the query, and with what credential.
+ *
+ * Takes its inputs as arguments rather than reading `config` directly so it can
+ * be exercised without one: `config` snapshots the environment at import, so a
+ * test that mutates `process.env` changes nothing — a trap worth designing out
+ * rather than remembering.
+ *
+ * The key authenticates against The Graph's gateway and nothing else, so it is
+ * required only when we are actually talking to the gateway. A local mirror or
+ * a test double needs no credential, and demanding a dummy one would make the
+ * documented override unusable for the thing it exists for.
+ */
+export const resolveEndpoint = (
+  override: string | undefined,
+  apiKey: string | undefined,
+): { url: string; apiKey?: string } => {
+  if (!override && !apiKey) {
     throw new Error(
       'GRAPH_API_KEY is not set — the AI3/USD oracle cannot query the pool ' +
-        'subgraph, so USDC payments cannot be quoted',
+        'subgraph through the gateway, so USDC payments cannot be quoted ' +
+        '(set GRAPH_SUBGRAPH_URL instead to point at an unauthenticated mirror)',
     )
   }
-  return { url: config.priceOracle.subgraphUrl || defaultSubgraphUrl(), apiKey }
+  return { url: override || defaultSubgraphUrl(), apiKey }
 }
 
 const assertPoolIdentity = (
   pool: NonNullable<NonNullable<GraphResponse['data']>['pool']>,
 ): void => {
   const expected = [
-    { side: 'token0', address: WAI3_ADDRESS, decimals: WAI3_DECIMALS },
+    { side: 'token0', address: WAI3_ADDRESS, decimals: AI3_DECIMALS },
     { side: 'token1', address: USDC_ADDRESS, decimals: USDC_DECIMALS },
   ] as const
   const actual = [pool.token0, pool.token1]
@@ -163,13 +179,16 @@ export const fetchRecentSwaps = async (
   limit: number,
   signal?: AbortSignal,
 ): Promise<SwapWindowResponse> => {
-  const { url, apiKey } = requireEndpoint()
+  const { url, apiKey } = resolveEndpoint(
+    config.priceOracle.subgraphUrl,
+    config.priceOracle.graphApiKey,
+  )
 
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
+      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
     },
     body: JSON.stringify({
       query: RECENT_SWAPS_QUERY,
@@ -199,11 +218,21 @@ export const fetchRecentSwaps = async (
   if (!body.data?._meta) {
     throw new Error('Subgraph query returned no indexing metadata')
   }
+  const indexerTimestamp = body.data._meta.block.timestamp
+  if (typeof indexerTimestamp !== 'number') {
+    throw new Error(
+      'Subgraph reported no block timestamp, so how far behind it is cannot ' +
+        'be judged',
+    )
+  }
   if (!body.data.pool) {
     throw new Error(
       `Subgraph has no pool ${POOL_ID} — wrong subgraph, or the pool identity ` +
         'in pool.ts is stale',
     )
+  }
+  if (!Array.isArray(body.data.swaps)) {
+    throw new Error('Subgraph query returned no swaps collection')
   }
   assertPoolIdentity(body.data.pool)
 
@@ -212,7 +241,7 @@ export const fetchRecentSwaps = async (
   // row, not an unusable response, and the sample-count guard already decides
   // whether what remains is enough.
   const samples: SwapSample[] = body.data.swaps.flatMap((swap) => {
-    const ai3Amount = toBaseUnits(swap.amount0, WAI3_DECIMALS)
+    const ai3Amount = toBaseUnits(swap.amount0, AI3_DECIMALS)
     const usdcAmount = toBaseUnits(swap.amount1, USDC_DECIMALS)
     if (ai3Amount <= 0n || usdcAmount <= 0n) {
       return []
@@ -222,7 +251,6 @@ export const fetchRecentSwaps = async (
         ai3Amount,
         usdcAmount,
         timestampMs: Number(swap.timestamp) * 1000,
-        blockNumber: BigInt(swap.transaction?.blockNumber ?? 0),
       },
     ]
   })
@@ -230,7 +258,7 @@ export const fetchRecentSwaps = async (
   return {
     samples,
     indexerBlock: BigInt(body.data._meta.block.number),
-    indexerTimestampMs: body.data._meta.block.timestamp * 1000,
+    indexerTimestampMs: indexerTimestamp * 1000,
     hasIndexingErrors: body.data._meta.hasIndexingErrors,
   }
 }

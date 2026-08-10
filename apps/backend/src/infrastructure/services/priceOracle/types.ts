@@ -35,7 +35,6 @@ export type SwapSample = {
   // AI3 base units (shannons, 18 decimals), absolute.
   ai3Amount: bigint
   timestampMs: number
-  blockNumber: bigint
 }
 
 /**
@@ -57,6 +56,10 @@ export type SwapWindow = {
   // Total USDC base units traded across the surviving samples — the weight
   // behind the average, and what makes it expensive to move.
   volumeUsdc: bigint
+  // Span of the SURVIVING samples, not of everything fetched. Every field in
+  // this struct describes the same set of fills, so an operator reading
+  // "7 swaps over 4 days" is reading one consistent window rather than a count
+  // from after the trim against a span from before it.
   newestSwapMs: number
   oldestSwapMs: number
   // Indexer head at query time. The window can be perfectly healthy while the
@@ -79,6 +82,10 @@ export type OracleUnavailableReason =
   // The most recent swap is older than the freshness bound — the market has
   // stopped, whatever the indexer says.
   | 'stale-window'
+  // The surviving fills are packed into too short an interval to be a market.
+  // A handful of swaps in one block is something anyone can print on demand;
+  // a price held across hours is not.
+  | 'narrow-window'
   // The window traded too little for its average to mean anything.
   | 'thin-volume'
   // The derived price sits outside the configured sanity bounds.

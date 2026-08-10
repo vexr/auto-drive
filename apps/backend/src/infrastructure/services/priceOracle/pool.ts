@@ -15,16 +15,15 @@ export const WAI3_ADDRESS: Address =
 export const USDC_ADDRESS: Address =
   '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
 
-export const WAI3_DECIMALS = 18
-export const USDC_DECIMALS = 6
-
 /**
  * Uniswap v4 identifies a pool by the keccak256 hash of its PoolKey rather than
  * by a contract address, so the key below is the pool's full identity.
  *
- * The unit tests assert that these components hash to POOL_ID. That assertion
+ * `pool.spec.ts` asserts that these components hash to POOL_ID. That assertion
  * is what pins the currency ordering — swapping currency0/currency1 silently
- * inverts every price derived from this pool, which no other test would catch.
+ * inverts every price derived from this pool, which no other test would catch,
+ * and which the adapter's runtime identity check reads this same ordering to
+ * detect.
  */
 export const POOL_KEY = {
   currency0: WAI3_ADDRESS, // sorts below USDC, so WAI3 is currency0

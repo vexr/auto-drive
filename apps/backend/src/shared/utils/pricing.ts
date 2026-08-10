@@ -1,17 +1,24 @@
 import { USD_RATE_DECIMALS } from '@auto-drive/models'
 
 // AI3 base units (shannons) per whole AI3, and USDC base units per whole USDC.
-const AI3_DECIMALS = 18
-const USDC_DECIMALS = 6
+// Exported as the single definition: the oracle derives a rate with these and
+// this module prices a purchase with them, and the two are only inverses of
+// each other while they agree.
+export const AI3_DECIMALS = 18
+export const USDC_DECIMALS = 6
 
 // The USD value of `shannons` at `usdPerAi3` (scaled 1e18), expressed in USDC
 // base units, is:
 //
 //   (shannons / 10^18) * (usdPerAi3 / 10^18) * 10^6
 //     = shannons * usdPerAi3 / 10^(18 + 18 - 6)
-const USDC_CONVERSION_EXPONENT = BigInt(
+//
+// The oracle inverts this exact relation to turn a swap's two legs into a
+// price, so the factor is exported rather than restated there.
+export const USDC_CONVERSION_EXPONENT = BigInt(
   AI3_DECIMALS + USD_RATE_DECIMALS - USDC_DECIMALS,
 )
+export const USDC_CONVERSION_FACTOR = 10n ** USDC_CONVERSION_EXPONENT
 
 /**
  * Convert an AI3 amount (shannons) into its USDC-base-unit value at a given
@@ -36,8 +43,10 @@ export const ai3ShannonsToUsdcBaseUnits = (
   if (usdPerAi3 < 0n) {
     throw new Error(`Invalid AI3/USD rate: ${usdPerAi3}`)
   }
-  const divisor = 10n ** USDC_CONVERSION_EXPONENT
-  return (shannons * usdPerAi3 + divisor - 1n) / divisor
+  return (
+    (shannons * usdPerAi3 + USDC_CONVERSION_FACTOR - 1n) /
+    USDC_CONVERSION_FACTOR
+  )
 }
 
 /**
