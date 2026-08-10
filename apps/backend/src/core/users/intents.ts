@@ -153,14 +153,14 @@ const parseRequestedBytes = (
 //
 // It also does not bound what the user ends up with. Credits follow the amount
 // actually paid, not requestedBytes, so paying more than quoted grants more than
-// was checked here — and on the USDC path slightly more than proportionally,
-// because the locked effective rate carries the price impact of the QUOTED size
-// and a larger conversion slips further down the curve. That drift is a deliberate
-// accepted cost of letting any payment amount settle an intent, and it is the
-// authoritative check that bounds it: re-measuring the real balance under the
-// advisory lock, an overpayment can walk an account up to the cap but never past
-// it. The excess lands as OVER_CAP for admin review, which is the same place an
-// unchecked purchase would have landed.
+// was checked here — proportionally more, on either payment method, because an
+// intent locks a single scalar rate (shannonsPerByte, and on the USDC path the
+// effective rate #747 persists) and nothing on it varies with the size paid for.
+// That drift is a deliberate accepted cost of letting any payment amount settle
+// an intent, and it is the authoritative check that bounds it: re-measuring the
+// real balance under the advisory lock, an overpayment can walk an account up to
+// the cap but never past it. The excess lands as OVER_CAP for admin review,
+// which is the same place an unchecked purchase would have landed.
 //
 // Measures exactly what the authoritative check measures — SUM of
 // upload_bytes_remaining over active, unexpired rows — by going through
