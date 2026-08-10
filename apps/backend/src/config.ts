@@ -4,7 +4,6 @@ import { AccountModel } from '@auto-drive/models'
 import {
   optionalBoolEnvironmentVariable,
   env,
-  nonNegativeIntEnv,
   positiveIntEnv,
 } from './shared/utils/misc.js'
 import { getAddress } from 'viem'
@@ -215,57 +214,56 @@ export const config = {
     rpcUrl: process.env.ETH_CHAIN_ENDPOINT,
   },
   priceOracle: {
-    // AI3/USD price oracle, read from the Uniswap v4 WAI3/USDC pool on Ethereum.
-    // See infrastructure/services/priceOracle.
+    // AI3/USD price oracle: the volume-weighted average of the Uniswap WAI3/USDC
+    // pool's most recent swaps, read from the pool's published subgraph through
+    // The Graph's gateway. See infrastructure/services/priceOracle.
     //
-    // How long a freshly read price is served from memory before a refresh.
-    // Applies to the marginal price only — an executable quote always reads the
-    // chain, since it backs a binding charge.
+    // Realized fills rather than pool state, because the treasury no longer
+    // swaps per intent — USDC accumulates and is converted manually — so what a
+    // purchase should be priced against is what the pool has actually been
+    // filling at, fee and impact included.
+    //
+    // Gateway endpoint for the subgraph, and the API key it is queried with.
+    // Both read directly (not via `env`) so they stay optional: a deployment
+    // that does not quote in USDC boots without them, and the oracle fails fast
+    // naming the missing variable the first time a rate is needed.
+    subgraphUrl: process.env.GRAPH_SUBGRAPH_URL,
+    graphApiKey: process.env.GRAPH_API_KEY,
+    // How long a freshly derived rate is served from memory before a refresh.
+    // Safe to cache, unlike the spot price this replaced: a minute cannot move
+    // an average built from days of fills.
     cacheTtlMs: positiveIntEnv('ORACLE_CACHE_TTL_MS', 60000),
-    // Longest a last-good price may be served as a fallback while the pool
+    // Longest a last-good price may be served as a fallback while the window
     // cannot be read. Default: 10 minutes.
     maxStaleMs: positiveIntEnv('ORACLE_MAX_STALE_MS', 600000),
-    // Timeout for a SINGLE RPC request, applied by the viem transport. Every
-    // oracle operation issues several, so this must stay well below
-    // `fetchTimeoutMs` or the total budget fires first and the per-request
-    // bound never applies.
-    rpcTimeoutMs: positiveIntEnv('ORACLE_RPC_TIMEOUT_MS', 5000),
-    // Total budget for one whole oracle operation — the multi-call sequence, not
-    // a single request. A marginal price read is 3 requests, an executable quote
-    // 4, and building the TWAP reference is 1 + one log query per chunk. Must be
-    // a multiple of `rpcTimeoutMs`; validated at load in the priceOracle module.
-    fetchTimeoutMs: positiveIntEnv('ORACLE_FETCH_TIMEOUT_MS', 30000),
-    // Drop the quote if the block the pool state came from is older than this,
-    // which catches a lagging RPC node. Default: 5 minutes.
-    maxSourceAgeMs: positiveIntEnv('ORACLE_MAX_SOURCE_AGE_MS', 300000),
-    // Manipulation gate. The pool has no oracle hook, so every read is
-    // single-block spot state that a trade immediately before our read moves.
-    // The reference is therefore built here: a time-weighted average price over
-    // the last `twapWindowBlocks`, reconstructed from the PoolManager's `Swap`
-    // events (each carries its post-swap price) plus one state read for the
-    // price standing at the window's start. Blocks are the time unit — Ethereum
-    // slots are 12s by protocol — so 7200 blocks is ~24h.
-    //
-    // Needs an RPC that serves logs AND state at that depth, i.e. an
-    // archive-capable endpoint. The gate fails closed, so a pruned node refuses
-    // every quote rather than silently leaving them unguarded.
-    twapWindowBlocks: nonNegativeIntEnv('ORACLE_TWAP_WINDOW_BLOCKS', 7200),
-    // eth_getLogs range per request. Providers commonly cap this at 10k blocks;
-    // the window is split into chunks of this size and queried in parallel.
-    twapLogChunkBlocks: positiveIntEnv('ORACLE_TWAP_LOG_CHUNK_BLOCKS', 5000),
-    // How long a derived TWAP is reused. It is a 24h average, so a few minutes
-    // of staleness cannot move it materially, and each rebuild costs several
-    // log queries.
-    twapTtlMs: positiveIntEnv('ORACLE_TWAP_TTL_MS', 300000),
-    // The gate is asymmetric because the two directions are not symmetric risks.
-    // Spot BELOW the average under-collects: the user is charged for AI3 at a
-    // price the treasury may not be able to re-acquire it at once the push
-    // decays. That is the profitable direction to attack, so it is bounded
-    // tightly. Spot ABOVE the average overcharges the user, who sees the quote
-    // before paying and can decline — bounded loosely, as an integration rail
-    // rather than a manipulation control.
-    maxSpotDiscountPercent: Number(env('ORACLE_MAX_SPOT_DISCOUNT', '25')),
-    maxSpotPremiumPercent: Number(env('ORACLE_MAX_SPOT_PREMIUM', '50')),
+    // Budget for the whole subgraph query, including connect and body read.
+    requestTimeoutMs: positiveIntEnv('ORACLE_REQUEST_TIMEOUT_MS', 10000),
+    // How many recent swaps to average. Larger windows are harder to move and
+    // slower to react; on a pool trading ~1.6 times a day, 10 swaps is roughly
+    // a week, which is why the freshness guard below judges the NEWEST swap
+    // rather than the window's span.
+    swapSampleSize: positiveIntEnv('ORACLE_SWAP_SAMPLE_SIZE', 10),
+    // Fewest swaps that may stand behind a rate, checked both on the raw window
+    // and again after the outlier trim. Below this the average is an anecdote.
+    minSwapSamples: positiveIntEnv('ORACLE_MIN_SWAP_SAMPLES', 5),
+    // Refuse to quote when the most recent swap is older than this: a window
+    // can be perfectly well-formed and still describe a market that has since
+    // stopped trading. Default: 24 hours.
+    maxSwapAgeMs: positiveIntEnv('ORACLE_MAX_SWAP_AGE_MS', 86400000),
+    // Refuse to quote when the indexer's own head is older than this. Distinct
+    // from the swap-age guard on purpose — an indexer that has stalled and a
+    // pool that has gone quiet look identical in the data and need different
+    // responses. Default: 15 minutes.
+    maxIndexLagMs: positiveIntEnv('ORACLE_MAX_INDEX_LAG_MS', 900000),
+    // Least USDC volume (in whole USDC) the surviving samples must total. A
+    // thin pool is cheap to print prices on, and without this floor ten dust
+    // swaps would set the price of every purchase.
+    minWindowVolumeUsdc: env('ORACLE_MIN_WINDOW_VOLUME_USDC', '1000'),
+    // Drop swaps whose realized price deviates further than this (percent) from
+    // the window's median before averaging. Volume weighting alone does not
+    // cover a manipulating trade that is simply large — there, its weight is
+    // exactly what makes it dangerous.
+    maxSwapDeviationPercent: Number(env('ORACLE_MAX_SWAP_DEVIATION', '25')),
     // Sanity bounds (USD per AI3) as plain decimals — kept as raw strings and
     // parsed to the 1e18 scale in the priceOracle module (parsing the string
     // directly avoids Number.toString() exponential notation for small values).
