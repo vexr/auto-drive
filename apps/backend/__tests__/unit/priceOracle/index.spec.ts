@@ -7,6 +7,7 @@ import {
   afterEach,
 } from '@jest/globals'
 import { priceOracle } from '../../../src/infrastructure/services/priceOracle/index.js'
+import { SubgraphConfigError } from '../../../src/infrastructure/services/priceOracle/subgraph.js'
 import type { SwapSample } from '../../../src/infrastructure/services/priceOracle/types.js'
 
 // Defaults from config: cacheTtlMs 60s, maxStaleMs 600s, requestTimeoutMs 10s,
@@ -38,6 +39,32 @@ const swapsAt = (
     timestampMs: timestampMs - i * 3_600_000,
   }))
 
+// This pool's real fills, read from the gateway on 2026-08-10 and ordered newest
+// first, as [AI3 whole tokens, USDC whole tokens, seconds before now]. Volume is
+// doubled and the timestamps compressed so that the freshness and volume guards
+// pass and the price TREND is the only thing under test — the prices themselves
+// are exactly what the pool filled at, falling 59% across the window.
+const LIVE_DOWNTREND: [number, number, number][] = [
+  [199392.024, 477.128529, 600],
+  [91895.484, 286.993475, 3600],
+  [35931.88, 127.829951, 7200],
+  [118194.35, 501.438685, 10800],
+  [8120.565, 39.943132, 14400],
+  [29431.44, 151.891229, 18000],
+  [10000.0013, 54.31106, 21600],
+  [10000, 55.773014, 25200],
+  [10000, 57.29481, 28800],
+  [10000, 58.879753, 32400],
+]
+
+const liveDowntrendAt = (now: number): SwapSample[] =>
+  LIVE_DOWNTREND.map(([ai3, usdc, secondsAgo]) => ({
+    // x2 volume, via whole tokens -> base units without float error at 1e18.
+    ai3Amount: BigInt(Math.round(ai3 * 2 * 1e6)) * 10n ** 12n,
+    usdcAmount: BigInt(Math.round(usdc * 2 * 1e6)),
+    timestampMs: now - secondsAgo * 1000,
+  }))
+
 const windowAt = (
   now: number,
   overrides: {
@@ -60,9 +87,19 @@ const mockWindow = (
     .spyOn(priceOracle._internal, 'fetchRecentSwaps')
     .mockImplementation(async () => build(Date.now()))
 
+// Every test here stubs the adapter, so nothing should ever reach `fetch`. That
+// is asserted rather than assumed: `config` reads a developer's .env at import,
+// so a test that forgot to stub would quietly query the live gateway — and pass
+// or fail depending on whether the pool traded this week.
+const failOnUnstubbedFetch = () =>
+  jest.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    throw new Error(`unstubbed network call to ${String(input)}`)
+  })
+
 describe('priceOracle.getPrice', () => {
   beforeEach(() => {
     priceOracle._reset()
+    failOnUnstubbedFetch()
     jest.useFakeTimers()
   })
 
@@ -235,6 +272,19 @@ describe('priceOracle.getPrice', () => {
       expect(await refusalReason()).toBe('gateway')
     })
 
+    it('separates a wrong deployment from an unreachable one', async () => {
+      // A stale POOL_ID or a missing GRAPH_API_KEY is fixed by a redeploy, not
+      // by waiting, and reporting it as `gateway` would send whoever is paged
+      // to The Graph's status page to debug our own constant.
+      jest
+        .spyOn(priceOracle._internal, 'fetchRecentSwaps')
+        .mockRejectedValue(
+          new SubgraphConfigError('Subgraph has no pool 0xdead'),
+        )
+
+      expect(await refusalReason()).toBe('misconfigured')
+    })
+
     it('refuses when the indexer reports indexing errors', async () => {
       mockWindow((now) => ({ ...windowAt(now), hasIndexingErrors: true }))
 
@@ -327,6 +377,63 @@ describe('priceOracle.getPrice', () => {
       expect(await refusalReason()).toBe('insufficient-samples')
     })
 
+    it('refuses when the market has re-priced past the window', async () => {
+      // The defect this closes, taken from this pool's own history rather than
+      // invented: the price fell 59% across the window, so the fills carrying
+      // the NEW price were the minority — and a count-based median trims the
+      // minority. The seven survivors average 0.004698 USD/AI3 while the pool's
+      // most recent fill was 0.002393, a rate 96% above anything that traded,
+      // and it clears every other guard (7 samples, 1839 USDC, spanning 6h, in
+      // bounds). Charging at the old regime is the one outcome worse than not
+      // quoting, so the newest fill gets a veto.
+      mockWindow((now) => ({
+        ...windowAt(now),
+        samples: liveDowntrendAt(now),
+      }))
+
+      expect(await refusalReason()).toBe('market-moved')
+    })
+
+    it('still trims an outlier that is not the newest fill', async () => {
+      // The veto must not cost the trim its original job. One absurd print in
+      // the middle of the window is dropped and the rest prices as before,
+      // because the market's latest fill still agrees with the median.
+      mockWindow((now) => ({
+        ...windowAt(now),
+        samples: [
+          ...swapsAt(3, now - 60_000),
+          ...swapsAt(1, now - 60_000 - 3 * 3_600_000, USDC_PER_SWAP * 10n),
+          ...swapsAt(3, now - 60_000 - 4 * 3_600_000),
+        ],
+      }))
+
+      const result = await priceOracle.getPrice()
+
+      expect(result.isOk()).toBe(true)
+      expect(result._unsafeUnwrap().usdPerAi3).toBe(PRICE)
+      expect(priceOracle.getHealth().window).toMatchObject({
+        sampleCount: 6,
+        droppedOutliers: 1,
+      })
+    })
+
+    it('prices a market that moved within the trim band', async () => {
+      // Volatility is not a regime change: a newest fill 20% off the median
+      // survives the trim, so it votes instead of vetoing.
+      mockWindow((now) => ({
+        ...windowAt(now),
+        samples: [
+          ...swapsAt(1, now - 60_000, (USDC_PER_SWAP * 80n) / 100n),
+          ...swapsAt(4, now - 60_000 - 3_600_000),
+        ],
+      }))
+
+      const result = await priceOracle.getPrice()
+
+      expect(result.isOk()).toBe(true)
+      expect(result._unsafeUnwrap().usdPerAi3).toBeLessThan(PRICE)
+    })
+
     it('refuses a window that traded below the volume floor', async () => {
       // Five swaps totalling 50 USDC — well-formed, fresh, and meaningless.
       mockWindow((now) => ({
@@ -367,6 +474,7 @@ describe('priceOracle.getPrice', () => {
 describe('priceOracle.getHealth', () => {
   beforeEach(() => {
     priceOracle._reset()
+    failOnUnstubbedFetch()
     jest.useFakeTimers()
   })
 
@@ -415,6 +523,27 @@ describe('priceOracle.getHealth', () => {
     expect(health.lastFailureReason).toBe('gateway')
     expect(health.window?.usdPerAi3).toBe(PRICE) // the successful one, retained
     expect(health.servingStale).toBe(true)
+  })
+
+  it('reports a recovery as recovered, without losing the blip', async () => {
+    const spy = mockWindow()
+    await priceOracle.getPrice()
+
+    jest.advanceTimersByTime(TTL_MS + 1)
+    spy.mockRejectedValueOnce(new Error('gateway 503'))
+    await priceOracle.getPrice()
+
+    jest.advanceTimersByTime(TTL_MS + 1)
+    await priceOracle.getPrice()
+
+    const health = priceOracle.getHealth()
+
+    // No longer degraded — the current read succeeds.
+    expect(health.servingStale).toBe(false)
+    // But the failure stays on the record, and stays PAIRED with its reason:
+    // clearing one and not the other rendered "last failure 5m ago (null)".
+    expect(health.lastFailureAt).not.toBeNull()
+    expect(health.lastFailureReason).toBe('gateway')
   })
 
   it('does not trigger an upstream read', async () => {

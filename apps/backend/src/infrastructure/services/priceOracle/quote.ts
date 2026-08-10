@@ -1,4 +1,5 @@
 import { USD_RATE_DECIMALS } from '@auto-drive/models'
+import { USDC_CONVERSION_FACTOR } from '../../../shared/utils/pricing.js'
 import type { SwapSample } from './types.js'
 
 /**
@@ -50,8 +51,12 @@ export const isFresh = (
 //
 //   usdPerAi3 = (usdc / 10^6) / (ai3 / 10^18) * 10^18
 //             = usdc * 10^(18 + 18 - 6) / ai3
-const PRICE_CONVERSION_EXPONENT = BigInt(18 + USD_RATE_DECIMALS - 6)
-const PRICE_CONVERSION_FACTOR = 10n ** PRICE_CONVERSION_EXPONENT
+//
+// That is the same 10^30 the quoting layer multiplies BY to turn a rate back
+// into a USDC charge, so it is imported rather than restated: two definitions
+// of one factor is two things that must agree, on the path that decides what a
+// user is charged. `ai3ShannonsToUsdcBaseUnits` is this function's inverse.
+const PRICE_CONVERSION_FACTOR = USDC_CONVERSION_FACTOR
 
 /**
  * The price a single swap actually filled at, scaled by USD_RATE_SCALE (1e18).

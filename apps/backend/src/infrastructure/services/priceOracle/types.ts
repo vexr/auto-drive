@@ -77,11 +77,23 @@ export type SwapWindow = {
 export type OracleUnavailableReason =
   // The gateway could not be reached, errored, or returned unusable JSON.
   | 'gateway'
+  // The deployment itself is wrong, not the market: no credential to query
+  // with, or a subgraph that does not describe the pool we pinned. Separated
+  // from `gateway` because waiting fixes one and only a redeploy fixes the
+  // other, and an operator paged for an outage should not spend the incident
+  // looking at The Graph's status page.
+  | 'misconfigured'
   // Too few usable swaps in the window (before or after the outlier trim).
   | 'insufficient-samples'
   // The most recent swap is older than the freshness bound — the market has
   // stopped, whatever the indexer says.
   | 'stale-window'
+  // The market has re-priced past the window: the newest fill is itself an
+  // outlier against the median of the rest, so the average describes a regime
+  // the market has already left. Refusing is deliberate — the alternative is
+  // charging at the OLD price, because a count-based median discards the very
+  // fills that carry the new one.
+  | 'market-moved'
   // The surviving fills are packed into too short an interval to be a market.
   // A handful of swaps in one block is something anyone can print on demand;
   // a price held across hours is not.
@@ -106,6 +118,11 @@ export type OracleUnavailableReason =
  */
 export type OracleHealth = {
   lastSuccessAt: Date | null
+  // The last failure, whenever it happened — history, retained after a
+  // recovery, which is what #811's "which guard last fired" asks for. The two
+  // fields are always set together, so a dashboard can never render a time
+  // without the reason that went with it. Whether the oracle is failing RIGHT
+  // NOW is `servingStale`, or the error `getPrice` returns.
   lastFailureAt: Date | null
   lastFailureReason: OracleUnavailableReason | null
   window: SwapWindow | null

@@ -26,6 +26,23 @@ import {
 import { parseDecimalToScaledBigint } from './quote.js'
 import type { SwapSample } from './types.js'
 
+/**
+ * The deployment is wrong, as opposed to the source being down.
+ *
+ * Thrown for the failures a redeploy fixes and waiting does not: no credential
+ * to query with, or a subgraph that does not describe the pool `pool.ts` pins.
+ * It exists so index.ts can report those as `misconfigured` rather than folding
+ * them into `gateway` — "we cannot reach The Graph" and "we are pointed at the
+ * wrong pool" send an operator to two different places, and the taxonomy is
+ * there precisely so a dashboard need not guess which one it is.
+ */
+export class SubgraphConfigError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'SubgraphConfigError'
+  }
+}
+
 export type SwapWindowResponse = {
   // Newest first, as returned; samples with a zero leg are already dropped.
   samples: SwapSample[]
@@ -134,7 +151,7 @@ export const resolveEndpoint = (
   apiKey: string | undefined,
 ): SubgraphEndpoint => {
   if (!override && !apiKey) {
-    throw new Error(
+    throw new SubgraphConfigError(
       'GRAPH_API_KEY is not set — the AI3/USD oracle cannot query the pool ' +
         'subgraph through the gateway, so USDC payments cannot be quoted ' +
         '(set GRAPH_SUBGRAPH_URL instead to point at an unauthenticated mirror)',
@@ -155,14 +172,14 @@ const assertPoolIdentity = (
   expected.forEach(({ side, address, decimals }, index) => {
     const token = actual[index]
     if (token.id.toLowerCase() !== address.toLowerCase()) {
-      throw new Error(
+      throw new SubgraphConfigError(
         `Subgraph pool ${POOL_ID} has ${side}=${token.id}, expected ` +
           `${address} — this is a different pool, or its currencies are ` +
           'ordered the other way round, either of which inverts every price',
       )
     }
     if (Number(token.decimals) !== decimals) {
-      throw new Error(
+      throw new SubgraphConfigError(
         `Subgraph pool ${POOL_ID} reports ${side} decimals=${token.decimals}, ` +
           `expected ${decimals} — the price scaling assumes otherwise`,
       )
@@ -244,7 +261,7 @@ export const fetchRecentSwapsFrom = async (
     )
   }
   if (!body.data.pool) {
-    throw new Error(
+    throw new SubgraphConfigError(
       `Subgraph has no pool ${POOL_ID} — wrong subgraph, or the pool identity ` +
         'in pool.ts is stale',
     )

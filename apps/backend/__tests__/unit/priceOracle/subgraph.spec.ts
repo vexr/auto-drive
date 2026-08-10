@@ -10,6 +10,7 @@ import {
   fetchRecentSwapsFrom,
   resolveEndpoint,
   RECENT_SWAPS_QUERY,
+  SubgraphConfigError,
 } from '../../../src/infrastructure/services/priceOracle/subgraph.js'
 import {
   POOL_ID,
@@ -157,6 +158,10 @@ describe('priceOracle/subgraph', () => {
   })
 
   describe('identity', () => {
+    // Every failure in this block is a deployment mistake rather than an
+    // outage, and each is typed as such so index.ts can report `misconfigured`
+    // instead of folding it into "we cannot reach The Graph" — the diagnosis
+    // that sends an operator to a status page to debug a stale constant.
     it('rejects a pool whose currencies are the other way round', async () => {
       // The failure this exists for: every price would simply be inverted, and
       // nothing downstream could tell.
@@ -174,6 +179,7 @@ describe('priceOracle/subgraph', () => {
       await expect(fetchSwaps(10)).rejects.toThrow(
         /ordered the other way round/,
       )
+      await expect(fetchSwaps(10)).rejects.toBeInstanceOf(SubgraphConfigError)
     })
 
     it('rejects decimals that contradict the price scaling', async () => {
@@ -196,6 +202,17 @@ describe('priceOracle/subgraph', () => {
 
       await expect(fetchSwaps(10)).rejects.toThrow(
         new RegExp(`no pool ${POOL_ID}`),
+      )
+      await expect(fetchSwaps(10)).rejects.toBeInstanceOf(SubgraphConfigError)
+    })
+
+    it('does not type a transport failure as a configuration problem', async () => {
+      // The distinction only earns its keep if it stays narrow: a 5xx is still
+      // an outage, and must not be reported as "fix your deployment".
+      respondWith({ message: 'bad gateway' }, { ok: false, status: 502 })
+
+      await expect(fetchSwaps(10)).rejects.not.toBeInstanceOf(
+        SubgraphConfigError,
       )
     })
   })
@@ -262,6 +279,11 @@ describe('priceOracle/subgraph', () => {
     it('requires an API key when talking to the gateway', () => {
       expect(() => resolveEndpoint(undefined, undefined)).toThrow(
         /GRAPH_API_KEY/,
+      )
+      // Typed, so a deployment missing its credential is reported as
+      // `misconfigured` rather than as an unreachable gateway.
+      expect(() => resolveEndpoint(undefined, undefined)).toThrow(
+        SubgraphConfigError,
       )
     })
 

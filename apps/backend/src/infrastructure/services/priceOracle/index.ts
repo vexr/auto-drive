@@ -10,7 +10,7 @@ import {
   volumeWeightedPrice,
   windowVolumeUsdc,
 } from './quote.js'
-import { fetchRecentSwaps } from './subgraph.js'
+import { fetchRecentSwaps, SubgraphConfigError } from './subgraph.js'
 import {
   OracleUnavailableError,
   type OracleHealth,
@@ -58,6 +58,21 @@ if (config.priceOracle.minSwapSamples > config.priceOracle.swapSampleSize) {
       `<= ORACLE_SWAP_SAMPLE_SIZE (${config.priceOracle.swapSampleSize}) — ` +
       'the floor cannot exceed the number of swaps ever requested, or every ' +
       'window fails the sample-count guard',
+  )
+}
+
+// The two time bounds are checked against each other because getting them the
+// wrong way round WEAKENS the oracle silently, unlike the misconfigurations
+// above which merely refuse everything. The window filter runs first, so if it
+// is the tighter of the two, every surviving fill is younger than the freshness
+// bound by construction and the "is this market still alive" guard can never
+// fire — a market that stopped six days ago would be priced as current.
+if (config.priceOracle.maxSwapAgeMs > config.priceOracle.maxWindowAgeMs) {
+  throw new Error(
+    `ORACLE_MAX_SWAP_AGE_MS (${config.priceOracle.maxSwapAgeMs}) must be <= ` +
+      `ORACLE_MAX_WINDOW_AGE_MS (${config.priceOracle.maxWindowAgeMs}) — the ` +
+      'window filter runs first, so a wider freshness bound than window bound ' +
+      'makes the freshness guard unreachable',
   )
 }
 
@@ -112,8 +127,15 @@ let inFlight: Promise<Result<OraclePrice, OracleUnavailableError>> | null = null
 // because "why is the USDC path shut" is answered by the failure, not the price.
 let lastWindow: SwapWindow | null = null
 let lastSuccessAt: Date | null = null
+// The last failure, whenever it was. Retained through a recovery, and always
+// set as a PAIR, so a dashboard cannot render a failure time next to a null
+// reason — which is what happened when a success cleared one and not the other.
 let lastFailureAt: Date | null = null
 let lastFailureReason: OracleUnavailableReason | null = null
+// Whether the MOST RECENT attempt failed, and how. Distinct from the pair
+// above: that one answers "which guard last fired", this one answers "is the
+// oracle degraded right now", and only the second may be cleared by a success.
+let currentFailureReason: OracleUnavailableReason | null = null
 
 const unavailable = (
   message: string,
@@ -121,6 +143,7 @@ const unavailable = (
 ): OracleUnavailableError => {
   lastFailureAt = new Date()
   lastFailureReason = reason
+  currentFailureReason = reason
   logger.warn(`Price oracle unavailable (${reason}): ${message}`)
   return new OracleUnavailableError(message, reason)
 }
@@ -138,7 +161,9 @@ const unavailable = (
  * the outlier trim, because trimming cannot rescue a window whose newest fill
  * is a week old. Volume is judged after the trim, since the volume that backs
  * the average is the surviving volume, not what was discarded with the
- * outliers.
+ * outliers. The newest fill's veto sits immediately after the trim, because it
+ * asks a question only the trim's result can answer: did we just discard the
+ * market's latest price as an outlier?
  */
 const buildWindow = async (): Promise<
   Result<SwapWindow, OracleUnavailableError>
@@ -157,8 +182,17 @@ const buildWindow = async (): Promise<
     )
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    // A response that does not describe the pool we pinned is our mistake, not
+    // The Graph's, and it is the one failure here that no amount of waiting
+    // clears. Reporting it as `gateway` would send an operator to a status page
+    // to diagnose a stale constant.
     return err(
-      unavailable(`could not read the subgraph: ${message}`, 'gateway'),
+      error instanceof SubgraphConfigError
+        ? unavailable(
+            `the oracle is not configured to read this pool: ${message}`,
+            'misconfigured',
+          )
+        : unavailable(`could not read the subgraph: ${message}`, 'gateway'),
     )
   }
 
@@ -182,7 +216,7 @@ const buildWindow = async (): Promise<
       unavailable(
         `the indexer is ${Math.round(lagMs / 1000)}s behind at block ` +
           `${response.indexerBlock}, past the ` +
-          `${config.priceOracle.maxIndexLagMs}ms limit`,
+          `${Math.round(config.priceOracle.maxIndexLagMs / 1000)}s limit`,
         'indexer-lag',
       ),
     )
@@ -200,13 +234,20 @@ const buildWindow = async (): Promise<
     isFresh(sample.timestampMs, now, config.priceOracle.maxWindowAgeMs),
   )
   if (inWindow.length < config.priceOracle.minSwapSamples) {
+    // Two different situations, and blaming the window for both sends an
+    // operator looking for fills that were filtered when the pool never traded
+    // them: nothing was dropped when the counts agree.
+    const windowDays = Math.round(
+      config.priceOracle.maxWindowAgeMs / 86_400_000,
+    )
     return err(
       unavailable(
-        `only ${inWindow.length} of ${response.samples.length} recent swaps ` +
-          `fall within the ${Math.round(
-            config.priceOracle.maxWindowAgeMs / 86_400_000,
-          )}d window, below the floor of ` +
-          `${config.priceOracle.minSwapSamples}`,
+        inWindow.length === response.samples.length
+          ? `the subgraph returned only ${inWindow.length} usable swaps for ` +
+              `this pool, below the floor of ${config.priceOracle.minSwapSamples}`
+          : `only ${inWindow.length} of ${response.samples.length} recent ` +
+              `swaps fall within the ${windowDays}d window, below the floor ` +
+              `of ${config.priceOracle.minSwapSamples}`,
         'insufficient-samples',
       ),
     )
@@ -246,10 +287,44 @@ const buildWindow = async (): Promise<
   const newestSwapMs = Math.max(...kept.map((s) => s.timestampMs))
   const oldestSwapMs = Math.min(...kept.map((s) => s.timestampMs))
 
-  // The trim's median is count-based, so whoever supplies most of the window
-  // sets the price — and on a pool this thin that is a handful of fills. Volume
-  // alone does not stop it: an attacker who clears the volume floor with their
-  // own trades clears it with trades priced wherever they like.
+  // The trim's median is count-based, which cuts both ways. It removes the lone
+  // absurd print it was built for — but when the MARKET moves, the fills
+  // carrying the new price are the minority, so those are the ones it discards,
+  // and what survives is a majority that has not re-priced yet. The average is
+  // then serenely wrong in the direction of the old regime, with every other
+  // guard satisfied: enough samples, enough volume, spanning hours, in bounds.
+  //
+  // This is not hypothetical. On this pool's own history (2026-08-10) the trim
+  // dropped the three most recent fills and kept the seven older ones, and the
+  // rate that would have been served sat 96% above the last price the pool
+  // actually filled at. At 1.6 swaps/day the window needs days to catch up, and
+  // every purchase in between is charged at a price nobody traded.
+  //
+  // So: the newest fill in the window gets a veto. If it is itself an outlier
+  // against the rest, the window is describing a regime the market has left,
+  // and the answer is to stop quoting until enough fills agree again. Denial,
+  // not mispricing — the same direction every other guard here fails in. It
+  // costs nothing when the market is merely volatile-but-continuous, because
+  // then the newest fill sits inside the band.
+  if (newestSwapMs < windowNewestMs) {
+    return err(
+      unavailable(
+        `the most recent fill (${Math.round(
+          (now - windowNewestMs) / 60_000,
+        )}min ago) deviated past ` +
+          `${config.priceOracle.maxSwapDeviationPercent}% from the median of ` +
+          `this ${inWindow.length}-fill window and was trimmed, so the ` +
+          'average describes a price the market has since left',
+        'market-moved',
+      ),
+    )
+  }
+
+  // The same count-based median has an adversarial edge as well as the accident
+  // above: whoever supplies most of the window sets the price, and on a pool
+  // this thin that is a handful of fills. Volume alone does not stop it, since
+  // an attacker who clears the volume floor with their own trades clears it with
+  // trades priced wherever they like.
   //
   // Time is the scarce thing they cannot fake. Six fills in one block are
   // something anyone can print on demand; the same six spread across hours must
@@ -383,7 +458,9 @@ const refresh = async (): Promise<
   lastGood = value
   lastWindow = window.value
   lastSuccessAt = value.asOf
-  lastFailureReason = null
+  // Only the "right now" half is cleared: which guard last fired stays on the
+  // record for the dashboard, paired with when it fired.
+  currentFailureReason = null
   logger.debug(
     `Price oracle refreshed AI3/USD=${window.value.usdPerAi3.toString()} ` +
       `(scaled 1e18) from ${window.value.sampleCount} swaps totalling ` +
@@ -422,8 +499,10 @@ const getPrice = async (): Promise<
   }
   if (now < nextAttemptAt) {
     // Upstream was attempted recently and is degraded; serve the last-good
-    // fallback (stale) rather than re-querying.
-    return serveStaleOrError(lastFailureReason ?? 'gateway')
+    // fallback (stale) rather than re-querying. The reason comes from the
+    // CURRENT failure, never the retained history, so a long-recovered blip
+    // cannot be reported as the thing closing the path.
+    return serveStaleOrError(currentFailureReason ?? 'gateway')
   }
   if (inFlight) {
     return inFlight
@@ -452,9 +531,11 @@ const getHealth = (): OracleHealth => ({
   // "The last attempt failed and there is still something to serve." Note this
   // cannot be inferred from `cache` being expired: a failed refresh leaves the
   // stale entry in place rather than evicting it, so an expired cache is the
-  // normal state between reads, not a symptom.
+  // normal state between reads, not a symptom. Keyed off the current failure
+  // rather than the retained one, or the oracle would look degraded forever
+  // after its first bad read.
   servingStale:
-    lastFailureReason !== null &&
+    currentFailureReason !== null &&
     lastGood !== null &&
     Date.now() - lastGood.asOf.getTime() < config.priceOracle.maxStaleMs,
 })
@@ -469,6 +550,7 @@ const reset = (): void => {
   lastSuccessAt = null
   lastFailureAt = null
   lastFailureReason = null
+  currentFailureReason = null
 }
 
 export const priceOracle = {
