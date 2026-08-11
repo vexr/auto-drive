@@ -85,6 +85,12 @@ export type OracleUnavailableReason =
   | 'misconfigured'
   // Too few usable swaps in the window (before or after the outlier trim).
   | 'insufficient-samples'
+  // The opposite problem: the window held more fills than one query may return,
+  // so what came back is the newest N of it — a count window, which is what
+  // selecting by time exists to avoid. Raising ORACLE_MAX_WINDOW_SAMPLES is the
+  // fix; refusing meanwhile is the only honest answer, since a median over an
+  // unbounded window is one we cannot vouch for.
+  | 'window-truncated'
   // The most recent swap is older than the freshness bound — the market has
   // stopped, whatever the indexer says.
   | 'stale-window'

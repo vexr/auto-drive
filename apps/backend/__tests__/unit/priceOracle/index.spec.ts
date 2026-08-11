@@ -11,11 +11,13 @@ import { SubgraphConfigError } from '../../../src/infrastructure/services/priceO
 import type { SwapSample } from '../../../src/infrastructure/services/priceOracle/types.js'
 
 // Defaults from config: cacheTtlMs 60s, maxStaleMs 600s, requestTimeoutMs 10s,
-// sample size 10 / floor 5, max swap age 24h, max index lag 15min, min window
-// volume 1000 USDC, outlier trim at 25%, bounds [0.0001, 100] USD/AI3.
+// row cap 1000 / floor 5, window 7d, max swap age 24h, max index lag 15min, min
+// window volume 1000 USDC, outlier trim at 25%, bounds [0.0001, 100] USD/AI3.
 const TTL_MS = 60_000
 const MAX_STALE_MS = 600_000
 const MAX_SWAP_AGE_MS = 86_400_000
+const MAX_WINDOW_AGE_MS = 604_800_000
+const MAX_WINDOW_SAMPLES = 1000
 const MAX_INDEX_LAG_MS = 900_000
 
 const PRICE = 6_400_000_000_000_000n // 0.0064 USD/AI3, scaled 1e18
@@ -73,6 +75,7 @@ const windowAt = (
     indexerBlock?: bigint
     hasIndexingErrors?: boolean
     unparsedSwaps?: number
+    truncated?: boolean
   } = {},
 ) => ({
   samples: overrides.samples ?? swapsAt(5, now - 60_000),
@@ -80,6 +83,7 @@ const windowAt = (
   indexerTimestampMs: overrides.indexerTimestampMs ?? now - 12_000,
   hasIndexingErrors: overrides.hasIndexingErrors ?? false,
   unparsedSwaps: overrides.unparsedSwaps ?? 0,
+  truncated: overrides.truncated ?? false,
 })
 
 const mockWindow = (
@@ -285,6 +289,33 @@ describe('priceOracle.getPrice', () => {
         )
 
       expect(await refusalReason()).toBe('misconfigured')
+    })
+
+    it('asks for a window of time, capped by count', async () => {
+      // The order of these two is the guard: time selects the fills and the count
+      // only bounds the response. Selecting by count and filtering by age
+      // afterwards lets a burst evict the market's history, because filtering can
+      // only shrink the count and never reach past it.
+      const spy = mockWindow()
+
+      await priceOracle.getPrice()
+
+      expect(spy).toHaveBeenCalledWith(
+        {
+          sinceMs: Date.now() - MAX_WINDOW_AGE_MS,
+          maxSamples: MAX_WINDOW_SAMPLES,
+        },
+        expect.anything(),
+      )
+    })
+
+    it('refuses a window that came back at the response cap', async () => {
+      // A full page means the fills held are the newest slice of the window, so
+      // the median is count-based again — the property selecting by time removes.
+      // Refusing names the knob; averaging a slice would look like success.
+      mockWindow((now) => windowAt(now, { truncated: true }))
+
+      expect(await refusalReason()).toBe('window-truncated')
     })
 
     it('refuses when the indexer reports indexing errors', async () => {

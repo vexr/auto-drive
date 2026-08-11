@@ -230,11 +230,19 @@ export const config = {
     maxStaleMs: positiveIntEnv('ORACLE_MAX_STALE_MS', 600000),
     // Budget for the whole subgraph query, including connect and body read.
     requestTimeoutMs: positiveIntEnv('ORACLE_REQUEST_TIMEOUT_MS', 10000),
-    // How many recent swaps to average. Larger windows are harder to move and
-    // slower to react; on a pool trading ~1.6 times a day, 10 swaps is roughly
-    // a week, which is why the freshness guard below judges the NEWEST swap
-    // rather than the window's span.
-    swapSampleSize: positiveIntEnv('ORACLE_SWAP_SAMPLE_SIZE', 10),
+    // Cap on how many fills one query may return. NOT the window: the window is
+    // selected by time (ORACLE_MAX_WINDOW_AGE_MS, below) in the query itself,
+    // and this only bounds the response size.
+    //
+    // The distinction is the difference between an attacker having to out-trade
+    // the market and merely having to out-number a fixed slot count: fills
+    // selected by count, then filtered by age, let a burst EVICT history rather
+    // than compete with it, since filtering can only shrink the count and never
+    // reach past it. So this wants to sit far above any real week: the busiest
+    // 7 days in this pool's whole recorded history is 53 fills, against a
+    // default of 1000. A full page means the window may have been cut short and
+    // is refused rather than averaged, so raise this rather than lower it.
+    maxWindowSamples: positiveIntEnv('ORACLE_MAX_WINDOW_SAMPLES', 1000),
     // Fewest swaps that may stand behind a rate, checked both on the raw window
     // and again after the outlier trim. Below this the average is an anecdote.
     minSwapSamples: positiveIntEnv('ORACLE_MIN_SWAP_SAMPLES', 5),
@@ -242,12 +250,13 @@ export const config = {
     // can be perfectly well-formed and still describe a market that has since
     // stopped trading. Default: 24 hours.
     maxSwapAgeMs: positiveIntEnv('ORACLE_MAX_SWAP_AGE_MS', 86400000),
-    // Oldest a fill may be and still count toward the average. This is the
-    // window's LOWER bound, and it is what stops a majority of ancient fills
-    // from carrying the median — at which point the trim would discard the
-    // recent ones as outliers and the rate would come from another era.
-    // Default: 7 days, chosen against this pool's ~1.6 swaps/day so a full
-    // 10-swap window can normally be assembled inside it.
+    // The window itself: fills older than this are not fetched, and cannot vote.
+    // It is what stops a majority of ancient fills from carrying the median — at
+    // which point the trim would discard the recent ones as outliers and the rate
+    // would come from another era — and, being applied at the source, it is also
+    // what makes the window a period rather than a slot count.
+    // Default: 7 days, which at this pool's ~1.6 swaps/day normally holds
+    // comfortably more than the ORACLE_MIN_SWAP_SAMPLES floor.
     maxWindowAgeMs: positiveIntEnv('ORACLE_MAX_WINDOW_AGE_MS', 604800000),
     // Least time the surviving fills must span. The outlier trim is count-based,
     // so whoever supplies most of the window sets the price; requiring the

@@ -6,6 +6,13 @@
  * judgement — how old is too old, how thin is too thin — belongs to index.ts,
  * so there is exactly one place where a refusal can originate.
  *
+ * The window's lower time bound is still index.ts's decision; it is merely
+ * APPLIED here, in the `where` clause, because a page limited by count cannot be
+ * turned back into a time window after the fact. Filtering a fixed number of
+ * newest fills can only shrink that number, never reach past it for an older
+ * one — so selecting by count and filtering by time afterwards let a burst of
+ * fills EVICT the market's history instead of competing with it.
+ *
  * The one exception is identity. A response describing the WRONG pool is not a
  * market condition to be judged, it is a misconfiguration, and it is checked
  * here because this is where the answer arrives: the tokens are verified
@@ -43,11 +50,35 @@ export class SubgraphConfigError extends Error {
   }
 }
 
+/**
+ * Which fills to ask for: everything the pool traded since `sinceMs`, up to
+ * `maxSamples` rows.
+ *
+ * The time bound SELECTS the window and the count only caps the response, and
+ * that order is the whole point. The other way round — newest N, then filter by
+ * age — makes the window a count window whatever the age bound says, because
+ * filtering can only shrink N. An attacker printing a bare majority of N fills
+ * then owns the median outright, at a cost that does not depend on how much the
+ * market traded: six fills buy six of ten slots whether the pool filled eleven
+ * times this week or eleven thousand.
+ */
+export type SwapWindowQuery = {
+  // Exclusive lower bound on a fill's timestamp.
+  sinceMs: number
+  // Cap on rows returned, sized so a real market never reaches it.
+  maxSamples: number
+}
+
 export type SwapWindowResponse = {
   // Newest first, as returned; samples with a zero leg are already dropped.
   samples: SwapSample[]
   indexerBlock: bigint
   indexerTimestampMs: number
+  // The page came back full, so there may be fills inside the window we never
+  // saw and this is a count window again — the very thing selecting by time
+  // exists to avoid. Reported rather than accepted: index.ts refuses, because a
+  // window we cannot bound is one whose median we cannot vouch for.
+  truncated: boolean
   // Rows dropped because an amount did not parse. Counted rather than swallowed:
   // the window is still usable, but a number above zero means the indexer is
   // emitting a format this oracle does not read, and that should be visible in a
@@ -63,6 +94,13 @@ export type SwapWindowResponse = {
  * source current?), the pool's identity (are we reading what we think?), and
  * the swaps themselves.
  *
+ * `timestamp_gt` is what makes this a time window rather than a count window:
+ * the server selects every fill inside the period and `first` only bounds the
+ * response. Both variable types are the schema's own, checked against the live
+ * gateway rather than assumed — `Swap_filter.timestamp_gt` is `BigInt`, and
+ * `Swap_filter.pool` is `String`, which is why an `ID!` variable has always been
+ * accepted there.
+ *
  * Amounts come back as BigDecimal strings in whole tokens — "199392.024", not
  * base units — and signed by direction, since one leg enters the pool while the
  * other leaves. `amountUSD` is deliberately not requested: it is the subgraph's
@@ -70,7 +108,7 @@ export type SwapWindowResponse = {
  * that changed hands. A realized fill is the whole point.
  */
 export const RECENT_SWAPS_QUERY = `
-  query RecentSwaps($pool: ID!, $first: Int!) {
+  query RecentSwaps($pool: ID!, $first: Int!, $since: BigInt!) {
     _meta {
       block {
         number
@@ -92,7 +130,7 @@ export const RECENT_SWAPS_QUERY = `
       first: $first
       orderBy: timestamp
       orderDirection: desc
-      where: { pool: $pool }
+      where: { pool: $pool, timestamp_gt: $since }
       subgraphError: allow
     ) {
       id
@@ -217,11 +255,12 @@ const assertPoolIdentity = (
 }
 
 /**
- * Fetch the most recent `limit` swaps for the pool from a given endpoint.
+ * Fetch every swap the pool has filled since `sinceMs`, up to `maxSamples` rows.
  *
  * Throws on anything that makes the response unusable — transport failure,
- * GraphQL errors, a missing or mismatched pool, an unparseable amount. The
- * caller turns that into an oracle outage; there is no partially usable window.
+ * GraphQL errors, a missing or mismatched pool. A single unreadable row is not
+ * that: it is dropped and counted. There is no partially usable RESPONSE, but
+ * there is a usable window with a row missing from it.
  *
  * Takes the endpoint rather than resolving one, so that everything below can be
  * exercised without an environment. `config` snapshots env at import: a suite
@@ -230,7 +269,7 @@ const assertPoolIdentity = (
  */
 export const fetchRecentSwapsFrom = async (
   { url, apiKey }: SubgraphEndpoint,
-  limit: number,
+  { sinceMs, maxSamples }: SwapWindowQuery,
   signal?: AbortSignal,
 ): Promise<SwapWindowResponse> => {
   const response = await fetch(url, {
@@ -241,7 +280,13 @@ export const fetchRecentSwapsFrom = async (
     },
     body: JSON.stringify({
       query: RECENT_SWAPS_QUERY,
-      variables: { pool: POOL_ID, first: limit },
+      variables: {
+        pool: POOL_ID,
+        first: maxSamples,
+        // graph-node's BigInt scalar is a string on the wire, and swap
+        // timestamps are seconds.
+        since: String(Math.floor(sinceMs / 1000)),
+      },
     }),
     signal,
   })
@@ -330,6 +375,10 @@ export const fetchRecentSwapsFrom = async (
   return {
     samples,
     unparsedSwaps,
+    // Counted on ROWS RETURNED, not on samples kept: a page can be full and
+    // still map to fewer samples, and it is the page being full that says the
+    // window may have been cut short.
+    truncated: body.data.swaps.length >= maxSamples,
     indexerBlock: BigInt(body.data._meta.block.number),
     indexerTimestampMs: indexerTimestamp * 1000,
     // Either signal counts. `hasIndexingErrors` is the deployment's own record
@@ -343,7 +392,7 @@ export const fetchRecentSwapsFrom = async (
 // The one line that reads configuration, kept thin so everything it wraps stays
 // testable without one.
 export const fetchRecentSwaps = (
-  limit: number,
+  query: SwapWindowQuery,
   signal?: AbortSignal,
 ): Promise<SwapWindowResponse> =>
   fetchRecentSwapsFrom(
@@ -351,6 +400,6 @@ export const fetchRecentSwaps = (
       config.priceOracle.subgraphUrl,
       config.priceOracle.graphApiKey,
     ),
-    limit,
+    query,
     signal,
   )

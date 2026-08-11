@@ -52,10 +52,10 @@ if (minScaled > maxScaled) {
   )
 }
 
-if (config.priceOracle.minSwapSamples > config.priceOracle.swapSampleSize) {
+if (config.priceOracle.minSwapSamples > config.priceOracle.maxWindowSamples) {
   throw new Error(
     `ORACLE_MIN_SWAP_SAMPLES (${config.priceOracle.minSwapSamples}) must be ` +
-      `<= ORACLE_SWAP_SAMPLE_SIZE (${config.priceOracle.swapSampleSize}) — ` +
+      `<= ORACLE_MAX_WINDOW_SAMPLES (${config.priceOracle.maxWindowSamples}) — ` +
       'the floor cannot exceed the number of swaps ever requested, or every ' +
       'window fails the sample-count guard',
   )
@@ -155,9 +155,11 @@ const unavailable = (
  * there is no partial answer between "here is a rate the market supports" and
  * "do not charge anyone right now".
  *
- * Order is deliberate. Indexer lag comes before anything derived from the
- * samples, because a stalled indexer makes every subsequent judgement a
- * statement about the past dressed up as the present. Freshness comes before
+ * Order is deliberate. Indexer lag and a truncated page come before anything
+ * derived from the samples, because both say the READ cannot be reasoned from —
+ * a stalled indexer makes every later judgement a statement about the past
+ * dressed up as the present, and a cut-short window turns the median back into
+ * a count-based one whatever the age bound says. Freshness comes before
  * the outlier trim, because trimming cannot rescue a window whose newest fill
  * is a week old. Volume is judged after the trim, since the volume that backs
  * the average is the surviving volume, not what was discarded with the
@@ -169,11 +171,18 @@ const buildWindow = async (): Promise<
   Result<SwapWindow, OracleUnavailableError>
 > => {
   const controller = new AbortController()
+  // One clock for the whole judgement, read before the query rather than after
+  // it: the window's lower bound goes INTO the request, and the age guards below
+  // must measure against the same instant that selected the fills.
+  const now = Date.now()
   let response: Awaited<ReturnType<typeof fetchRecentSwaps>>
   try {
     response = await withTimeout(
       internal.fetchRecentSwaps(
-        config.priceOracle.swapSampleSize,
+        {
+          sinceMs: now - config.priceOracle.maxWindowAgeMs,
+          maxSamples: config.priceOracle.maxWindowSamples,
+        },
         controller.signal,
       ),
       config.priceOracle.requestTimeoutMs,
@@ -196,8 +205,6 @@ const buildWindow = async (): Promise<
     )
   }
 
-  const now = Date.now()
-
   // Not a refusal — a dropped row only shrinks the window, and the sample floor
   // judges what is left. But it means the indexer is emitting an amount format
   // this oracle does not read, which is worth seeing in a log rather than
@@ -219,6 +226,23 @@ const buildWindow = async (): Promise<
     )
   }
 
+  // A full page means the window may extend past what came back, so the fills we
+  // hold are the newest N of it and the median is a count-based one again — the
+  // exact property selecting by time exists to remove. There is no honest way to
+  // average what we know might be a slice, so this refuses and names the knob to
+  // raise. It sits with the other structural checks rather than among the market
+  // ones because it says the QUERY was wrong, not that the market is.
+  if (response.truncated) {
+    return err(
+      unavailable(
+        `the pool filled at least ${config.priceOracle.maxWindowSamples} times ` +
+          'inside the window, which is the response cap, so the fills read back ' +
+          'may be only its newest slice — raise ORACLE_MAX_WINDOW_SAMPLES',
+        'window-truncated',
+      ),
+    )
+  }
+
   if (
     !isFresh(response.indexerTimestampMs, now, config.priceOracle.maxIndexLagMs)
   ) {
@@ -235,12 +259,17 @@ const buildWindow = async (): Promise<
 
   // Two age bounds, because they answer two different questions.
   //
-  // The window bound comes first and is a filter, not a refusal: a fill older
-  // than this may not VOTE. Without it the window has no lower bound at all,
-  // and a majority of ancient fills would carry the median — at which point the
-  // trim discards the recent ones as outliers and the oracle serves a price
-  // from another era. The bound has to be a filter rather than a check on the
-  // oldest sample, or one stale fill would deny an otherwise live window.
+  // The window bound is the one the query already applied, and it is a filter
+  // rather than a refusal: a fill older than this may not VOTE. Without it a
+  // majority of ancient fills could carry the median — at which point the trim
+  // discards the recent ones as outliers and the oracle serves a price from
+  // another era. A filter rather than a check on the oldest sample, or one stale
+  // fill would deny an otherwise live window.
+  //
+  // Re-applied here against the same clock even though the server filtered on
+  // it, because this is where the bound means something and the override may
+  // point at a mirror that honours the argument differently. It can only ever
+  // shrink the window, so the cost of it being redundant is nothing.
   const inWindow = response.samples.filter((sample) =>
     isFresh(sample.timestampMs, now, config.priceOracle.maxWindowAgeMs),
   )
@@ -254,9 +283,10 @@ const buildWindow = async (): Promise<
     return err(
       unavailable(
         inWindow.length === response.samples.length
-          ? `the subgraph returned only ${inWindow.length} usable swaps for ` +
-              `this pool, below the floor of ${config.priceOracle.minSwapSamples}`
-          : `only ${inWindow.length} of ${response.samples.length} recent ` +
+          ? `the pool filled only ${inWindow.length} usable swaps in the last ` +
+              `${windowDays}d, below the floor of ` +
+              `${config.priceOracle.minSwapSamples}`
+          : `only ${inWindow.length} of ${response.samples.length} returned ` +
               `swaps fall within the ${windowDays}d window, below the floor ` +
               `of ${config.priceOracle.minSwapSamples}`,
         'insufficient-samples',

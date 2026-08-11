@@ -43,7 +43,10 @@ const swap = (amount0: string, amount1: string, timestamp = '1785917567') => ({
 // An explicit endpoint, so nothing here depends on what happens to be in .env.
 const ENDPOINT = { url: 'https://subgraph.test/query', apiKey: 'test-key' }
 
-const fetchSwaps = (limit: number) => fetchRecentSwapsFrom(ENDPOINT, limit)
+const SINCE_MS = 1_785_800_000_000
+
+const fetchSwaps = (maxSamples: number, sinceMs = SINCE_MS) =>
+  fetchRecentSwapsFrom(ENDPOINT, { sinceMs, maxSamples })
 
 const respondWith = (
   body: unknown,
@@ -178,6 +181,37 @@ describe('priceOracle/subgraph', () => {
       // A zero leg is dropped, but it parsed — the two counts answer different
       // questions and only one of them means "the indexer changed format".
       expect((await fetchSwaps(10)).unparsedSwaps).toBe(0)
+    })
+
+    it('flags a full page, since the window may extend past it', async () => {
+      respondWith({
+        data: {
+          _meta: meta(),
+          pool: pool(),
+          swaps: [swap('1000.5', '-6.4032'), swap('1000.5', '-6.4032')],
+        },
+      })
+
+      expect((await fetchSwaps(2)).truncated).toBe(true)
+      expect((await fetchSwaps(3)).truncated).toBe(false)
+    })
+
+    it('judges truncation on rows returned, not on samples kept', async () => {
+      // A full page can map to fewer samples — a zero leg here — and it is the
+      // page being full that says fills may be missing, not what survived
+      // mapping.
+      respondWith({
+        data: {
+          _meta: meta(),
+          pool: pool(),
+          swaps: [swap('0', '-5.0'), swap('1000.5', '-6.4032')],
+        },
+      })
+
+      const { samples, truncated } = await fetchSwaps(2)
+
+      expect(samples).toHaveLength(1)
+      expect(truncated).toBe(true)
     })
 
     it('reports the indexer head and its error flag', async () => {
@@ -351,7 +385,10 @@ describe('priceOracle/subgraph', () => {
         data: { _meta: meta(), pool: pool(), swaps: [] },
       })
 
-      await fetchRecentSwapsFrom({ url: 'http://localhost:8000/x' }, 10)
+      await fetchRecentSwapsFrom(
+        { url: 'http://localhost:8000/x' },
+        { sinceMs: SINCE_MS, maxSamples: 10 },
+      )
 
       const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
       expect(init.headers).not.toHaveProperty('Authorization')
@@ -364,18 +401,37 @@ describe('priceOracle/subgraph', () => {
       expect(apiKey).toBe('a-key')
     })
 
-    it('sends the pool id and limit as query variables', async () => {
+    it('sends the pool id, the window start and the row cap as variables', async () => {
       const fetchMock = respondWith({
         data: { _meta: meta(), pool: pool(), swaps: [] },
       })
 
-      await fetchSwaps(7)
+      await fetchSwaps(7, 1_785_800_000_500)
 
       const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
       expect(JSON.parse(init.body as string)).toEqual({
         query: RECENT_SWAPS_QUERY,
-        variables: { pool: POOL_ID, first: 7 },
+        variables: {
+          pool: POOL_ID,
+          first: 7,
+          // Seconds, as a string: graph-node's BigInt scalar is a string on the
+          // wire, and swap timestamps are seconds.
+          since: '1785800000',
+        },
       })
+    })
+
+    it('selects the window by time, leaving the count as a cap', () => {
+      // The distinction the whole guard rests on. `first` alone selects the
+      // newest N and no age filter can reach past them for an older fill, so a
+      // burst of trades evicts history rather than competing with it.
+      expect(RECENT_SWAPS_QUERY).toMatch(
+        /where: \{ pool: \$pool, timestamp_gt: \$since \}/,
+      )
+      // The schema's own types, read from the live gateway: `timestamp_gt` is
+      // BigInt, and `Swap_filter.pool` is String — which is why an ID! variable
+      // has always been accepted there.
+      expect(RECENT_SWAPS_QUERY).toMatch(/\$since: BigInt!/)
     })
 
     it('asks for data alongside indexing errors rather than instead of it', () => {
