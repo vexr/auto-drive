@@ -72,12 +72,14 @@ const windowAt = (
     indexerTimestampMs?: number
     indexerBlock?: bigint
     hasIndexingErrors?: boolean
+    unparsedSwaps?: number
   } = {},
 ) => ({
   samples: overrides.samples ?? swapsAt(5, now - 60_000),
   indexerBlock: overrides.indexerBlock ?? BLOCK,
   indexerTimestampMs: overrides.indexerTimestampMs ?? now - 12_000,
   hasIndexingErrors: overrides.hasIndexingErrors ?? false,
+  unparsedSwaps: overrides.unparsedSwaps ?? 0,
 })
 
 const mockWindow = (
@@ -458,6 +460,27 @@ describe('priceOracle.getPrice', () => {
       }))
 
       expect(await refusalReason()).toBe('out-of-bounds')
+    })
+
+    it('treats a window thinned by unparseable rows as thin, not as an outage', async () => {
+      // Dropped rows can only shrink the window, so the sample floor is what
+      // refuses. What must NOT happen is the old behaviour, where one malformed
+      // amount failed the whole response and was reported as `gateway`.
+      mockWindow((now) => ({
+        ...windowAt(now, { unparsedSwaps: 6 }),
+        samples: swapsAt(4, now - 60_000),
+      }))
+
+      expect(await refusalReason()).toBe('insufficient-samples')
+    })
+
+    it('still prices a window that lost a row to an unparseable amount', async () => {
+      mockWindow((now) => windowAt(now, { unparsedSwaps: 1 }))
+
+      const result = await priceOracle.getPrice()
+
+      expect(result.isOk()).toBe(true)
+      expect(result._unsafeUnwrap().usdPerAi3).toBe(PRICE)
     })
 
     it('reports its own broken invariant as its own, not as an outage', async () => {

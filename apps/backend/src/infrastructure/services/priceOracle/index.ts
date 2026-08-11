@@ -198,6 +198,17 @@ const buildWindow = async (): Promise<
 
   const now = Date.now()
 
+  // Not a refusal — a dropped row only shrinks the window, and the sample floor
+  // judges what is left. But it means the indexer is emitting an amount format
+  // this oracle does not read, which is worth seeing in a log rather than
+  // deducing from a sample count that came back mysteriously low.
+  if (response.unparsedSwaps > 0) {
+    logger.warn(
+      `Price oracle dropped ${response.unparsedSwaps} fill(s) whose amounts ` +
+        'did not parse as plain decimals; the window was built from the rest',
+    )
+  }
+
   if (response.hasIndexingErrors) {
     return err(
       unavailable(

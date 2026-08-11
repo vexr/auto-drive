@@ -48,6 +48,11 @@ export type SwapWindowResponse = {
   samples: SwapSample[]
   indexerBlock: bigint
   indexerTimestampMs: number
+  // Rows dropped because an amount did not parse. Counted rather than swallowed:
+  // the window is still usable, but a number above zero means the indexer is
+  // emitting a format this oracle does not read, and that should be visible in a
+  // log instead of inferred from a sample count that came back low.
+  unparsedSwaps: number
   // The subgraph's own report that it failed to index something. Surfaced
   // rather than acted on here — index.ts owns what to do about it.
   hasIndexingErrors: boolean
@@ -128,8 +133,26 @@ type GraphResponse = {
 // magnitude the price math works in. The sign carries no price information —
 // which side of the trade a leg is on is the same fact twice — so it is dropped
 // here rather than propagated for every caller to remember to ignore.
-const toBaseUnits = (amount: string, decimals: number): bigint =>
-  parseDecimalToScaledBigint(amount.trim().replace(/^-/, ''), decimals)
+//
+// `null` for anything the parser does not accept, which for this input means
+// exponent notation. The parser is deliberately strict — it also parses the
+// configured price bounds, where silently mis-scaling a value would be far
+// worse — so the tolerance belongs here, at the row, rather than in it.
+//
+// Nothing in this pool's 236 recorded fills is anything but a plain decimal
+// (checked against the gateway 2026-08-11, at most 18 fractional digits), but
+// graph-node's BigDecimal is a Rust `bigdecimal` rendered through `Display`,
+// which switches to exponent form for scales far from zero, so it is not ruled
+// out either. Dropping the row costs nothing real: the only amounts extreme
+// enough to reach that form are dust that truncates to zero base units anyway —
+// already dropped below — or magnitudes neither token can represent.
+const toBaseUnits = (amount: string, decimals: number): bigint | null => {
+  try {
+    return parseDecimalToScaledBigint(amount.trim().replace(/^-/, ''), decimals)
+  } catch {
+    return null
+  }
+}
 
 /**
  * Where to send the query, and with what credential.
@@ -277,13 +300,21 @@ export const fetchRecentSwapsFrom = async (
   }
   assertPoolIdentity(body.data.pool)
 
-  // A swap with a zero leg has no price and would divide by zero downstream.
-  // Dropping it here rather than throwing is deliberate: it is one unusable
-  // row, not an unusable response, and the sample-count guard already decides
-  // whether what remains is enough.
+  // A row that cannot be used is dropped, never fatal — the same judgement for
+  // an amount that does not parse as for a zero leg, which is the inconsistency
+  // this once had: a zero leg was dropped per row while an unparseable one
+  // failed the entire response, and failed it as a network outage. One bad row
+  // is not an unreachable gateway, and the sample-count floor downstream already
+  // decides whether what survives is enough to price from. Fewer rows can only
+  // make the oracle refuse, never mislead it.
+  let unparsedSwaps = 0
   const samples: SwapSample[] = body.data.swaps.flatMap((swap) => {
     const ai3Amount = toBaseUnits(swap.amount0, AI3_DECIMALS)
     const usdcAmount = toBaseUnits(swap.amount1, USDC_DECIMALS)
+    if (ai3Amount === null || usdcAmount === null) {
+      unparsedSwaps += 1
+      return []
+    }
     if (ai3Amount <= 0n || usdcAmount <= 0n) {
       return []
     }
@@ -298,6 +329,7 @@ export const fetchRecentSwapsFrom = async (
 
   return {
     samples,
+    unparsedSwaps,
     indexerBlock: BigInt(body.data._meta.block.number),
     indexerTimestampMs: indexerTimestamp * 1000,
     // Either signal counts. `hasIndexingErrors` is the deployment's own record

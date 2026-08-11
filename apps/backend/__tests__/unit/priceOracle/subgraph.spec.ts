@@ -140,6 +140,46 @@ describe('priceOracle/subgraph', () => {
       expect(samples).toHaveLength(1)
     })
 
+    it('drops an amount it cannot parse instead of failing the window', async () => {
+      // Exponent notation is the realistic case: the parser rejects it (it also
+      // parses the configured price bounds, where mis-scaling silently would be
+      // worse), and graph-node renders BigDecimal through Rust's `Display`,
+      // which uses exponent form for scales far from zero. One such row used to
+      // fail the whole response — and be reported as a gateway outage.
+      respondWith({
+        data: {
+          _meta: meta(),
+          pool: pool(),
+          swaps: [
+            swap('1.5e-8', '-6.4032'),
+            swap('1000.5', '-6.4032'),
+            swap('1000.5', '-1E+3'),
+          ],
+        },
+      })
+
+      const { samples, unparsedSwaps } = await fetchSwaps(10)
+
+      expect(samples).toHaveLength(1)
+      // Counted, so the format problem is visible rather than showing up as a
+      // window that is inexplicably short.
+      expect(unparsedSwaps).toBe(2)
+    })
+
+    it('reports nothing unparsed for a well-formed response', async () => {
+      respondWith({
+        data: {
+          _meta: meta(),
+          pool: pool(),
+          swaps: [swap('1000.5', '-6.4032'), swap('0', '-5.0')],
+        },
+      })
+
+      // A zero leg is dropped, but it parsed — the two counts answer different
+      // questions and only one of them means "the indexer changed format".
+      expect((await fetchSwaps(10)).unparsedSwaps).toBe(0)
+    })
+
     it('reports the indexer head and its error flag', async () => {
       respondWith({
         data: {
