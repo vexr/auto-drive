@@ -167,10 +167,13 @@ type GraphResponse = {
   errors?: { message: string }[]
 }
 
-// A BigDecimal amount in whole tokens, signed by direction, as the base-unit
-// magnitude the price math works in. The sign carries no price information —
-// which side of the trade a leg is on is the same fact twice — so it is dropped
-// here rather than propagated for every caller to remember to ignore.
+// A BigDecimal amount in whole tokens, signed by direction, as a base-unit
+// magnitude plus that sign.
+//
+// The two legs of a swap always carry OPPOSITE signs — verified across all 236
+// fills this pool has recorded — so the direction is one fact, and the price math
+// wants magnitudes. Reading it off one leg and dropping it from both is what lets
+// `direction` be stated once rather than implied twice.
 //
 // `null` for anything the parser does not accept, which for this input means
 // exponent notation. The parser is deliberately strict — it also parses the
@@ -184,9 +187,21 @@ type GraphResponse = {
 // out either. Dropping the row costs nothing real: the only amounts extreme
 // enough to reach that form are dust that truncates to zero base units anyway —
 // already dropped below — or magnitudes neither token can represent.
-const toBaseUnits = (amount: string, decimals: number): bigint | null => {
+type SignedAmount = { magnitude: bigint; negative: boolean }
+
+const toBaseUnits = (
+  amount: string,
+  decimals: number,
+): SignedAmount | null => {
+  const trimmed = amount.trim()
   try {
-    return parseDecimalToScaledBigint(amount.trim().replace(/^-/, ''), decimals)
+    return {
+      magnitude: parseDecimalToScaledBigint(
+        trimmed.replace(/^-/, ''),
+        decimals,
+      ),
+      negative: trimmed.startsWith('-'),
+    }
   } catch {
     return null
   }
@@ -354,19 +369,30 @@ export const fetchRecentSwapsFrom = async (
   // make the oracle refuse, never mislead it.
   let unparsedSwaps = 0
   const samples: SwapSample[] = body.data.swaps.flatMap((swap) => {
-    const ai3Amount = toBaseUnits(swap.amount0, AI3_DECIMALS)
-    const usdcAmount = toBaseUnits(swap.amount1, USDC_DECIMALS)
-    if (ai3Amount === null || usdcAmount === null) {
+    const ai3 = toBaseUnits(swap.amount0, AI3_DECIMALS)
+    const usdc = toBaseUnits(swap.amount1, USDC_DECIMALS)
+    if (ai3 === null || usdc === null) {
       unparsedSwaps += 1
       return []
     }
-    if (ai3Amount <= 0n || usdcAmount <= 0n) {
+    if (ai3.magnitude <= 0n || usdc.magnitude <= 0n) {
+      return []
+    }
+    // Amounts are the POOL's deltas, so a positive USDC leg is USDC entering the
+    // pool: the trader paid USDC and took AI3 away. Read off the USDC leg
+    // because that is the side the oracle is denominated in, and cross-checked
+    // against the other: legs that agree in sign are not a swap, and none of
+    // this pool's 236 fills has ever done so. Dropped rather than trusted, on the
+    // same footing as any other unreadable row.
+    if (ai3.negative === usdc.negative) {
+      unparsedSwaps += 1
       return []
     }
     return [
       {
-        ai3Amount,
-        usdcAmount,
+        ai3Amount: ai3.magnitude,
+        usdcAmount: usdc.magnitude,
+        direction: usdc.negative ? ('sell' as const) : ('buy' as const),
         timestampMs: Number(swap.timestamp) * 1000,
       },
     ]

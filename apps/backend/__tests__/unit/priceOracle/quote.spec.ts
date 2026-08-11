@@ -22,6 +22,10 @@ const swap = (usdc: number, ai3: number, overrides: Partial<SwapSample> = {}) =>
   ({
     usdcAmount: BigInt(Math.round(usdc * 1e6)),
     ai3Amount: BigInt(Math.round(ai3 * 1e6)) * 10n ** 12n,
+    // The statistics here are direction-blind — a fill's price is the ratio of
+    // its legs either way — so the default is arbitrary and the field exists for
+    // the reporting layer above.
+    direction: 'sell',
     timestampMs: 1_700_000_000_000,
     ...overrides,
   }) satisfies SwapSample

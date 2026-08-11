@@ -22,18 +22,39 @@ export type OraclePrice = {
 }
 
 /**
+ * Which way a fill went, from the trader's side: `buy` paid USDC for AI3, `sell`
+ * the reverse.
+ *
+ * Kept rather than discarded because it is not the same fact as the amounts. The
+ * pool takes its fee from whichever leg is the INPUT, so a buy's realized price
+ * lands above mid and a sell's below, separated by roughly twice the swap fee —
+ * about 2.2% on this pool's composed 1.099%. Nothing corrects for it: it sits
+ * inside USD_QUOTE_MARGIN, and correcting it properly needs the composed fee
+ * hardcoded, which is the assumption reading realized fills exists to avoid.
+ *
+ * What it does buy is the ability to check the assumption that it averages out.
+ * A window's balance is not recoverable after the fact, and this pool's history
+ * says the question is live: 153 of its 236 fills are sells, and sell-heavy is
+ * the under-collecting direction. That needs no attacker, only a seller.
+ */
+export type SwapDirection = 'buy' | 'sell'
+
+/**
  * One realized swap, normalized out of the indexer's representation.
  *
- * Both legs are absolute base-unit amounts: the sign of a swap says which
- * direction it went, and a volume weighting does not care. What matters is that
- * the two legs belong to the same fill, because their ratio is a price the pool
- * actually honoured — fee and price impact included, unlike a quoted one.
+ * Both legs are absolute base-unit amounts and the direction is carried
+ * alongside them: which leg entered the pool is one fact, stated once, rather
+ * than a sign duplicated across two amounts that always disagree. What matters
+ * is that the two legs belong to the same fill, because their ratio is a price
+ * the pool actually honoured — fee and price impact included, unlike a quoted
+ * one.
  */
 export type SwapSample = {
   // USDC base units (6 decimals), absolute.
   usdcAmount: bigint
   // AI3 base units (shannons, 18 decimals), absolute.
   ai3Amount: bigint
+  direction: SwapDirection
   timestampMs: number
 }
 
@@ -53,6 +74,13 @@ export type SwapWindow = {
   // Swaps dropped by the trim, kept separate so a window that is mostly
   // outliers is visible rather than merely small.
   droppedOutliers: number
+  // How the surviving fills split by direction. Reported, not judged: the pool's
+  // fee makes a buy print above mid and a sell below, so a lopsided window is
+  // biased in a known direction and a dashboard should be able to say so. It is
+  // also the only way to find out whether the "flow balances out" assumption
+  // holds, since a window's balance cannot be recovered after the fact.
+  buyCount: number
+  sellCount: number
   // Total USDC base units traded across the surviving samples — the weight
   // behind the average, and what makes it expensive to move.
   volumeUsdc: bigint

@@ -432,6 +432,10 @@ const buildWindow = async (): Promise<
     usdPerAi3,
     sampleCount: kept.length,
     droppedOutliers: dropped,
+    // Recorded, never judged. A window's balance is a property of the flow and
+    // cannot be reconstructed later, so it is captured as it goes past.
+    buyCount: kept.filter((s) => s.direction === 'buy').length,
+    sellCount: kept.filter((s) => s.direction === 'sell').length,
     volumeUsdc,
     newestSwapMs,
     oldestSwapMs,

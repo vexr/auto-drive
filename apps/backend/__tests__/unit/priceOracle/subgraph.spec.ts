@@ -75,8 +75,9 @@ describe('priceOracle/subgraph', () => {
   })
 
   describe('mapping', () => {
-    it('scales whole-token BigDecimals into base units and drops the sign', () => {
-      // 199392.024 WAI3 out for 477.1285 USDC in, as the pool actually filled it.
+    it('scales whole-token BigDecimals into absolute base units', () => {
+      // 199392.024 WAI3 in for 477.1285 USDC out, as the pool actually filled it
+      // — this pool's most recent fill, and a sell.
       const fetchMock = respondWith({
         data: {
           _meta: meta(),
@@ -91,13 +92,19 @@ describe('priceOracle/subgraph', () => {
           {
             ai3Amount: 199_392_024_000_000_000_000_000n,
             usdcAmount: 477_128_500n,
+            direction: 'sell',
             timestampMs: 1_785_917_567_000,
           },
         ])
       })
     })
 
-    it('handles either trade direction', async () => {
+    it('reads direction off the USDC leg and keeps the legs absolute', async () => {
+      // Amounts are the POOL's deltas: USDC entering it (positive amount1) means
+      // the trader paid USDC and took AI3 away. Two fills identical but for
+      // direction price the same — the ratio of the legs is the price either
+      // way — while the direction itself is recorded once instead of being
+      // implied twice by two signs that always disagree.
       respondWith({
         data: {
           _meta: meta(),
@@ -109,7 +116,29 @@ describe('priceOracle/subgraph', () => {
       const { samples } = await fetchSwaps(10)
 
       expect(samples).toHaveLength(2)
-      expect(samples[0]).toEqual(samples[1])
+      expect(samples[0].direction).toBe('buy')
+      expect(samples[1].direction).toBe('sell')
+      expect(samples[0].usdcAmount).toBe(samples[1].usdcAmount)
+      expect(samples[0].ai3Amount).toBe(samples[1].ai3Amount)
+    })
+
+    it('drops a row whose legs agree in sign, which is not a swap', async () => {
+      // Both legs entering or both leaving is not a trade. None of this pool's
+      // 236 fills has ever looked like that, so it is dropped on the same footing
+      // as any other unreadable row rather than being given a direction.
+      respondWith({
+        data: {
+          _meta: meta(),
+          pool: pool(),
+          swaps: [swap('1000.5', '6.4032'), swap('1000.5', '-6.4032')],
+        },
+      })
+
+      const { samples, unparsedSwaps } = await fetchSwaps(10)
+
+      expect(samples).toHaveLength(1)
+      expect(samples[0].direction).toBe('sell')
+      expect(unparsedSwaps).toBe(1)
     })
 
     it('truncates fractional dust below one base unit rather than failing', async () => {

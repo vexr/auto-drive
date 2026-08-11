@@ -32,10 +32,12 @@ const swapsAt = (
   count: number,
   timestampMs: number,
   usdcAmount: bigint = USDC_PER_SWAP,
+  direction: SwapSample['direction'] = 'sell',
 ): SwapSample[] =>
   Array.from({ length: count }, (_, i) => ({
     usdcAmount,
     ai3Amount: AI3_PER_SWAP,
+    direction,
     // Spread backwards an hour apart, so `newest` is the one at timestampMs and
     // the window clears the 2h minimum span.
     timestampMs: timestampMs - i * 3_600_000,
@@ -64,6 +66,9 @@ const liveDowntrendAt = (now: number): SwapSample[] =>
     // x2 volume, via whole tokens -> base units without float error at 1e18.
     ai3Amount: BigInt(Math.round(ai3 * 2 * 1e6)) * 10n ** 12n,
     usdcAmount: BigInt(Math.round(usdc * 2 * 1e6)),
+    // Every one of these ten really was a sell — WAI3 in, USDC out — which is
+    // what a pool being drained looks like rather than a market with two sides.
+    direction: 'sell' as const,
     timestampMs: now - secondsAgo * 1000,
   }))
 
@@ -136,11 +141,13 @@ describe('priceOracle.getPrice', () => {
         ...Array.from({ length: 4 }, (_, i) => ({
           usdcAmount: 350_000n, // 0.35 USDC
           ai3Amount: 50n * 10n ** 18n, // 50 AI3 -> 0.007 USD/AI3
+          direction: 'sell' as const,
           timestampMs: now - 60_000 - i * 3_600_000,
         })),
         {
           usdcAmount: 3_200_000_000n, // 3200 USDC
           ai3Amount: 500_000n * 10n ** 18n, // 500k AI3 -> 0.0064
+          direction: 'sell' as const,
           timestampMs: now - 60_000,
         },
       ],
@@ -165,11 +172,13 @@ describe('priceOracle.getPrice', () => {
         ...Array.from({ length: 4 }, (_, i) => ({
           usdcAmount: 500_000n, // 0.5 USDC
           ai3Amount: 50n * 10n ** 18n, // 50 AI3 -> 0.01 USD/AI3
+          direction: 'sell' as const,
           timestampMs: now - 60_000 - i * 3_600_000,
         })),
         {
           usdcAmount: 3_200_000_000n,
           ai3Amount: 500_000n * 10n ** 18n, // 0.0064, 1000x the volume
+          direction: 'sell' as const,
           timestampMs: now - 60_000,
         },
       ],
@@ -361,6 +370,7 @@ describe('priceOracle.getPrice', () => {
           ...Array.from({ length: 8 }, (_, i) => ({
             usdcAmount: 1_000_000_000n,
             ai3Amount: 50_000n * 10n ** 18n, // 0.02 USD/AI3
+            direction: 'sell' as const,
             timestampMs: now - 30 * 86_400_000 - i * 3_600_000,
           })),
         ],
@@ -377,6 +387,7 @@ describe('priceOracle.getPrice', () => {
         samples: Array.from({ length: 6 }, (_, i) => ({
           usdcAmount: USDC_PER_SWAP,
           ai3Amount: AI3_PER_SWAP,
+          direction: 'sell' as const,
           timestampMs: now - 60_000 - i * 120_000, // 2 min apart
         })),
       }))
@@ -617,6 +628,29 @@ describe('priceOracle.getHealth', () => {
       droppedOutliers: 0,
       volumeUsdc: USDC_PER_SWAP * 5n,
       indexerBlock: BLOCK,
+    })
+  })
+
+  it('records how the window split by direction', async () => {
+    // Nothing judges this, and that is the point: the pool's fee makes a buy
+    // print above mid and a sell below, so a lopsided window is biased in a known
+    // direction — and its balance cannot be recovered after the fact. This pool
+    // has run 153 sells to 83 buys, so the "flow balances out" assumption is a
+    // live question rather than a safe one.
+    mockWindow((now) => ({
+      ...windowAt(now),
+      samples: [
+        ...swapsAt(2, now - 60_000, USDC_PER_SWAP, 'buy'),
+        ...swapsAt(3, now - 60_000 - 2 * 3_600_000, USDC_PER_SWAP, 'sell'),
+      ],
+    }))
+
+    await priceOracle.getPrice()
+
+    expect(priceOracle.getHealth().window).toMatchObject({
+      sampleCount: 5,
+      buyCount: 2,
+      sellCount: 3,
     })
   })
 
