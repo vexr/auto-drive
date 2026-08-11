@@ -140,9 +140,12 @@ const toBaseUnits = (amount: string, decimals: number): bigint =>
  * rather than remembering.
  *
  * The key authenticates against The Graph's gateway and nothing else, so it is
- * required only when we are actually talking to the gateway. A local mirror or
- * a test double needs no credential, and demanding a dummy one would make the
- * documented override unusable for the thing it exists for.
+ * required only when we are actually talking to the gateway, and it TRAVELS only
+ * there. An override names some other host — a local mirror, a test double, a
+ * tunnel — and attaching a billed credential to a request bound for it would
+ * hand the secret to whatever that variable happens to point at. So the key
+ * rides with the pinned gateway URL or not at all, which is also what makes the
+ * override safe to point anywhere.
  */
 export type SubgraphEndpoint = { url: string; apiKey?: string }
 
@@ -150,14 +153,17 @@ export const resolveEndpoint = (
   override: string | undefined,
   apiKey: string | undefined,
 ): SubgraphEndpoint => {
-  if (!override && !apiKey) {
+  if (override) {
+    return { url: override }
+  }
+  if (!apiKey) {
     throw new SubgraphConfigError(
       'GRAPH_API_KEY is not set — the AI3/USD oracle cannot query the pool ' +
         'subgraph through the gateway, so USDC payments cannot be quoted ' +
         '(set GRAPH_SUBGRAPH_URL instead to point at an unauthenticated mirror)',
     )
   }
-  return { url: override || defaultSubgraphUrl(), apiKey }
+  return { url: defaultSubgraphUrl(), apiKey }
 }
 
 const assertPoolIdentity = (

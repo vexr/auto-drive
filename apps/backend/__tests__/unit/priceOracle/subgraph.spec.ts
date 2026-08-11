@@ -296,6 +296,27 @@ describe('priceOracle/subgraph', () => {
       })
     })
 
+    it('never sends the gateway credential to an overridden host', () => {
+      // The key authenticates against The Graph's gateway and nothing else, so
+      // an override — a mirror, a test double, a tunnel — must not receive it.
+      // Both variables set is the normal state of a machine that also talks to
+      // the gateway, so this is the configuration, not a mistake.
+      const local = 'http://localhost:8000/subgraphs/name/uniswap-v4'
+
+      expect(resolveEndpoint(local, 'a-key').apiKey).toBeUndefined()
+    })
+
+    it('does not put the key in the request when there is none to send', async () => {
+      const fetchMock = respondWith({
+        data: { _meta: meta(), pool: pool(), swaps: [] },
+      })
+
+      await fetchRecentSwapsFrom({ url: 'http://localhost:8000/x' }, 10)
+
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+      expect(init.headers).not.toHaveProperty('Authorization')
+    })
+
     it('defaults to the pinned gateway subgraph when no override is given', () => {
       const { url, apiKey } = resolveEndpoint(undefined, 'a-key')
 
