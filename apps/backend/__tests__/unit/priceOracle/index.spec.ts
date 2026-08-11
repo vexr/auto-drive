@@ -396,6 +396,46 @@ describe('priceOracle.getPrice', () => {
       expect(await refusalReason()).toBe('market-moved')
     })
 
+    it('vetoes when a fill sharing the newest timestamp was trimmed', async () => {
+      // Same-block swaps share a timestamp — 7 of this pool's timestamps carry
+      // more than one fill. Comparing the surviving maximum against the window's
+      // maximum cannot see that: trim one of a pair and both maxima stay equal,
+      // so the veto reported the window as intact exactly when the market's
+      // latest print had been discarded. Which is what a sandwich produces.
+      mockWindow((now) => ({
+        ...windowAt(now),
+        samples: [
+          ...swapsAt(5, now - 60_000),
+          // A second fill at the same instant as the newest, at twice the price.
+          { ...swapsAt(1, now - 60_000, USDC_PER_SWAP * 2n)[0] },
+        ],
+      }))
+
+      expect(await refusalReason()).toBe('market-moved')
+    })
+
+    it('trims an outlier tied to an older fill without vetoing', async () => {
+      // The tie only matters at the newest timestamp. Sharing one with an older
+      // fill is the ordinary outlier case, and the trim keeps doing its job.
+      mockWindow((now) => ({
+        ...windowAt(now),
+        samples: [
+          ...swapsAt(5, now - 60_000),
+          {
+            ...swapsAt(1, now - 60_000 - 4 * 3_600_000, USDC_PER_SWAP * 2n)[0],
+          },
+        ],
+      }))
+
+      const result = await priceOracle.getPrice()
+
+      expect(result.isOk()).toBe(true)
+      expect(priceOracle.getHealth().window).toMatchObject({
+        sampleCount: 5,
+        droppedOutliers: 1,
+      })
+    })
+
     it('still trims an outlier that is not the newest fill', async () => {
       // The veto must not cost the trim its original job. One absurd print in
       // the middle of the window is dropped and the rest prices as before,

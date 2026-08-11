@@ -293,11 +293,6 @@ const buildWindow = async (): Promise<
     )
   }
 
-  // Every field from here describes the SURVIVING fills, so the span reported
-  // to an operator belongs to the same set as the count and the volume.
-  const newestSwapMs = Math.max(...kept.map((s) => s.timestampMs))
-  const oldestSwapMs = Math.min(...kept.map((s) => s.timestampMs))
-
   // The trim's median is count-based, which cuts both ways. It removes the lone
   // absurd print it was built for — but when the MARKET moves, the fills
   // carrying the new price are the minority, so those are the ones it discards,
@@ -317,19 +312,44 @@ const buildWindow = async (): Promise<
   // not mispricing — the same direction every other guard here fails in. It
   // costs nothing when the market is merely volatile-but-continuous, because
   // then the newest fill sits inside the band.
-  if (newestSwapMs < windowNewestMs) {
+  //
+  // The veto asks which SAMPLES survived, not whether the surviving maximum
+  // timestamp still equals the window's. Timestamps are not unique here: swaps
+  // in the same block share one, and 7 of this pool's timestamps carry more than
+  // one fill (three, at the most). With a tie, trimming one of them leaves both
+  // maxima equal, and comparing them would report a window as intact precisely
+  // when the newest print had been discarded — the veto silently stops firing in
+  // the case a sandwich produces.
+  //
+  // Every fill at that timestamp has to survive, because with a tie there is no
+  // ordering in the data that says which of them is the market's last word: the
+  // query can only sort by timestamp. Requiring all of them refuses in the
+  // ambiguous case, which is the direction this guard exists to fail in.
+  const survived = new Set(kept)
+  const newestFills = inWindow.filter((s) => s.timestampMs === windowNewestMs)
+  const vetoing = newestFills.filter((s) => !survived.has(s))
+  if (vetoing.length > 0) {
     return err(
       unavailable(
         `the most recent fill (${Math.round(
           (now - windowNewestMs) / 60_000,
         )}min ago) deviated past ` +
           `${config.priceOracle.maxSwapDeviationPercent}% from the median of ` +
-          `this ${inWindow.length}-fill window and was trimmed, so the ` +
-          'average describes a price the market has since left',
+          `this ${inWindow.length}-fill window and was trimmed` +
+          (newestFills.length > 1
+            ? ` (${vetoing.length} of the ${newestFills.length} fills sharing ` +
+              'that timestamp)'
+            : '') +
+          ', so the average describes a price the market has since left',
         'market-moved',
       ),
     )
   }
+
+  // Every field from here describes the SURVIVING fills, so the span reported
+  // to an operator belongs to the same set as the count and the volume.
+  const newestSwapMs = Math.max(...kept.map((s) => s.timestampMs))
+  const oldestSwapMs = Math.min(...kept.map((s) => s.timestampMs))
 
   // The same count-based median has an adversarial edge as well as the accident
   // above: whoever supplies most of the window sets the price, and on a pool
