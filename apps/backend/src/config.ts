@@ -269,9 +269,23 @@ export const config = {
     // pool that has gone quiet look identical in the data and need different
     // responses. Default: 15 minutes.
     maxIndexLagMs: positiveIntEnv('ORACLE_MAX_INDEX_LAG_MS', 900000),
-    // Least USDC volume (in whole USDC) the surviving samples must total. A
-    // thin pool is cheap to print prices on, and without this floor ten dust
-    // swaps would set the price of every purchase.
+    // Least USDC (in whole USDC) the pool must actually HOLD for its fills to be
+    // priced from. Depth, not volume: volume is what traded and can be churned in
+    // a circle for the fee, while depth has to be put there and left. It is read
+    // from the pool's own USDC balance in the same query the swaps come from.
+    //
+    // Not unmanufacturable — a trader can raise it by buying, which hands the
+    // pool USDC and takes AI3 away — but that commits the whole amount as
+    // inventory at price risk plus a round trip's fees, against roughly 1% of
+    // nominal to churn the same figure in volume. An order of magnitude dearer,
+    // not a closed door. Default 1000 USDC, to be re-derived once this pool
+    // trades again: it held 2898 USDC on 2026-08-11, having been at zero five
+    // days earlier.
+    minPoolUsdcDepth: env('ORACLE_MIN_POOL_USDC_DEPTH', '1000'),
+    // Least USDC volume (in whole USDC) the surviving samples must total on their
+    // LARGER side. Judged one-sided rather than in total because a round trip
+    // contributes both legs while committing capital once, so a total is inflated
+    // by exactly the churn this floor exists to reject.
     minWindowVolumeUsdc: env('ORACLE_MIN_WINDOW_VOLUME_USDC', '1000'),
     // Drop swaps whose realized price deviates further than this (percent) from
     // the window's median before averaging. Volume weighting alone does not

@@ -179,6 +179,35 @@ export const volumeWeightedPrice = (samples: SwapSample[]): bigint => {
 }
 
 // Total USDC base units traded across a window — the weight behind its average,
-// and the figure the thin-volume guard judges.
+// and what an operator means by "how much traded".
 export const windowVolumeUsdc = (samples: SwapSample[]): bigint =>
   samples.reduce((total, sample) => total + sample.usdcAmount, 0n)
+
+/**
+ * USDC volume of the window's LARGER side — the figure the thin-volume floor
+ * judges, rather than the total.
+ *
+ * A round trip contributes both of its legs to the total while committing capital
+ * only once: buy $500 of AI3 and sell it straight back and the total records
+ * ~$1000 traded against $500 committed and a net position of nothing. Judging the
+ * larger side alone cannot be inflated that way, so clearing the floor by
+ * churning costs about twice what it did.
+ *
+ * It never overstates what was committed, and it costs honest flow at most a
+ * factor of two — one-directional flow scores its full volume either way, and a
+ * perfectly balanced window scores half. That is a real tightening of the floor
+ * for real traders, which is why this is the SECOND barrier here rather than the
+ * main one: volume is a proxy for depth, and depth is now read directly.
+ */
+export const oneSidedVolumeUsdc = (samples: SwapSample[]): bigint => {
+  let buy = 0n
+  let sell = 0n
+  for (const sample of samples) {
+    if (sample.direction === 'buy') {
+      buy += sample.usdcAmount
+    } else {
+      sell += sample.usdcAmount
+    }
+  }
+  return buy > sell ? buy : sell
+}

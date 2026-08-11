@@ -5,6 +5,7 @@ import { withTimeout } from '../../../shared/utils/index.js'
 import {
   isFresh,
   isWithinBounds,
+  oneSidedVolumeUsdc,
   parseDecimalToScaledBigint,
   trimOutliers,
   volumeWeightedPrice,
@@ -97,17 +98,26 @@ const maxSwapDeviationBps = parsePercentToBps(
 // Configured in whole USDC because that is how a human reasons about "is this
 // market thick enough to price against"; compared in base units because that is
 // what the samples carry.
-const minWindowVolumeBaseUnits = (() => {
+const parseUsdcFloor = (raw: string, name: string): bigint => {
   try {
-    return parseDecimalToScaledBigint(config.priceOracle.minWindowVolumeUsdc, 6)
+    return parseDecimalToScaledBigint(raw, 6)
   } catch {
     throw new Error(
-      'Invalid ORACLE_MIN_WINDOW_VOLUME_USDC: ' +
-        `"${config.priceOracle.minWindowVolumeUsdc}" — use a plain decimal ` +
-        'number of USDC (e.g. 1000)',
+      `Invalid ${name}: "${raw}" — use a plain decimal number of USDC ` +
+        '(e.g. 1000)',
     )
   }
-})()
+}
+
+const minWindowVolumeBaseUnits = parseUsdcFloor(
+  config.priceOracle.minWindowVolumeUsdc,
+  'ORACLE_MIN_WINDOW_VOLUME_USDC',
+)
+
+const minPoolDepthBaseUnits = parseUsdcFloor(
+  config.priceOracle.minPoolUsdcDepth,
+  'ORACLE_MIN_POOL_USDC_DEPTH',
+)
 
 type CacheEntry = { value: OraclePrice; expiresAt: number }
 
@@ -253,6 +263,31 @@ const buildWindow = async (): Promise<
           `${response.indexerBlock}, past the ` +
           `${Math.round(config.priceOracle.maxIndexLagMs / 1000)}s limit`,
         'indexer-lag',
+      ),
+    )
+  }
+
+  // Depth, asked before anything about the fills, because it is a property of
+  // the POOL rather than of the window and needs no sample to judge.
+  //
+  // It is here because the volume floor below cannot carry this weight alone.
+  // Volume is what traded, and trading in a circle is cheap: a buy and a sell of
+  // the same size each contribute their full USDC leg, so an attacker clears a
+  // volume floor of N for roughly the swap fee on N — about 1% on this pool —
+  // while honest flow has to genuinely trade N. Raising the floor until it deters
+  // the attacker raises the bar for real traders a hundred times faster.
+  //
+  // Depth cannot be churned into existence. It can still be RAISED by buying,
+  // which hands the pool USDC and takes AI3 away, but that commits the whole
+  // amount as inventory at price risk plus a round trip's fees — an order of
+  // magnitude dearer than churn, not a closed door.
+  if (response.poolUsdcDepth < minPoolDepthBaseUnits) {
+    return err(
+      unavailable(
+        `the pool holds ${response.poolUsdcDepth} USDC base units, below the ` +
+          `${config.priceOracle.minPoolUsdcDepth} USDC floor — its fills are ` +
+          'not backed by a market deep enough to price from',
+        'thin-liquidity',
       ),
     )
   }
@@ -405,11 +440,17 @@ const buildWindow = async (): Promise<
     )
   }
 
+  // Judged on the larger side, not the total: a round trip contributes both of
+  // its legs to a total while committing capital once, so a total is inflated by
+  // exactly the churn this floor exists to reject. The total is still reported —
+  // it is what "how much traded" means — but it is not what decides.
   const volumeUsdc = windowVolumeUsdc(kept)
-  if (volumeUsdc < minWindowVolumeBaseUnits) {
+  const oneSidedVolume = oneSidedVolumeUsdc(kept)
+  if (oneSidedVolume < minWindowVolumeBaseUnits) {
     return err(
       unavailable(
-        `the window traded ${volumeUsdc} USDC base units, below the ` +
+        `the window's larger side traded ${oneSidedVolume} USDC base units ` +
+          `(${volumeUsdc} counting both), below the ` +
           `${config.priceOracle.minWindowVolumeUsdc} USDC floor — an average ` +
           'over dust is not a market price',
         'thin-volume',
@@ -437,6 +478,8 @@ const buildWindow = async (): Promise<
     buyCount: kept.filter((s) => s.direction === 'buy').length,
     sellCount: kept.filter((s) => s.direction === 'sell').length,
     volumeUsdc,
+    oneSidedVolumeUsdc: oneSidedVolume,
+    poolUsdcDepth: response.poolUsdcDepth,
     newestSwapMs,
     oldestSwapMs,
     indexerBlock: response.indexerBlock,

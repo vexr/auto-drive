@@ -79,6 +79,9 @@ export type SwapWindowResponse = {
   // exists to avoid. Reported rather than accepted: index.ts refuses, because a
   // window we cannot bound is one whose median we cannot vouch for.
   truncated: boolean
+  // USDC the pool currently holds, in base units. Depth, as opposed to volume:
+  // volume is what traded and can be churned, depth is what is sitting there.
+  poolUsdcDepth: bigint
   // Rows dropped because an amount did not parse. Counted rather than swallowed:
   // the window is still usable, but a number above zero means the indexer is
   // emitting a format this oracle does not read, and that should be visible in a
@@ -106,6 +109,13 @@ export type SwapWindowResponse = {
  * other leaves. `amountUSD` is deliberately not requested: it is the subgraph's
  * own valuation derived through its pricing paths, whereas amount1 IS the USDC
  * that changed hands. A realized fill is the whole point.
+ *
+ * `totalValueLockedToken1` is the pool's USDC balance, and it is asked for on the
+ * same grounds `amountUSD` is refused: it is a token quantity the pool holds
+ * rather than a valuation derived through anything. `totalValueLockedUSD` exists
+ * on this entity and is deliberately NOT used for that reason, and `liquidity`
+ * is not used because it is an in-range v4 L, a unit no operator can write a
+ * floor in. Field names read off the live schema by introspection.
  */
 export const RECENT_SWAPS_QUERY = `
   query RecentSwaps($pool: ID!, $first: Int!, $since: BigInt!) {
@@ -125,6 +135,7 @@ export const RECENT_SWAPS_QUERY = `
         id
         decimals
       }
+      totalValueLockedToken1
     }
     swaps(
       first: $first
@@ -161,6 +172,7 @@ type GraphResponse = {
     pool: {
       token0: { id: string; decimals: string }
       token1: { id: string; decimals: string }
+      totalValueLockedToken1: string
     } | null
     swaps: GraphSwap[]
   }
@@ -398,9 +410,28 @@ export const fetchRecentSwapsFrom = async (
     ]
   })
 
+  // The pool's own USDC balance. Unlike a swap row there is nothing to fall back
+  // on if it will not parse — a depth guard cannot be judged without it — so this
+  // one IS fatal, and `gateway` is the honest reason: the source returned JSON we
+  // cannot read. A NEGATIVE balance is a known accounting artifact of subgraph
+  // TVL tracking rather than unreadable data, and the only honest reading of
+  // negative depth is none, which the floor downstream will refuse.
+  const tvlToken1 = toBaseUnits(
+    body.data.pool.totalValueLockedToken1,
+    USDC_DECIMALS,
+  )
+  if (tvlToken1 === null) {
+    throw new Error(
+      'Subgraph reported an unreadable pool USDC balance ' +
+        `("${body.data.pool.totalValueLockedToken1}"), so the pool's depth ` +
+        'cannot be judged',
+    )
+  }
+
   return {
     samples,
     unparsedSwaps,
+    poolUsdcDepth: tvlToken1.negative ? 0n : tvlToken1.magnitude,
     // Counted on ROWS RETURNED, not on samples kept: a page can be full and
     // still map to fewer samples, and it is the page being full that says the
     // window may have been cut short.

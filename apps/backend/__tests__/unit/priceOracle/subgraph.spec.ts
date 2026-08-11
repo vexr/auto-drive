@@ -28,9 +28,13 @@ const meta = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 })
 
-const pool = () => ({
+// `totalValueLockedToken1` is the pool's USDC balance; 2898.005731 is what it
+// actually held on 2026-08-11, five days after being drained to zero.
+const pool = (overrides: Record<string, unknown> = {}) => ({
   token0: { id: WAI3_ADDRESS.toLowerCase(), decimals: '18' },
   token1: { id: USDC_ADDRESS.toLowerCase(), decimals: '6' },
+  totalValueLockedToken1: '2898.005731',
+  ...overrides,
 })
 
 const swap = (amount0: string, amount1: string, timestamp = '1785917567') => ({
@@ -243,6 +247,43 @@ describe('priceOracle/subgraph', () => {
       expect(truncated).toBe(true)
     })
 
+    it('reports the pool USDC balance as depth, in base units', async () => {
+      respondWith({
+        data: { _meta: meta(), pool: pool(), swaps: [] },
+      })
+
+      expect((await fetchSwaps(10)).poolUsdcDepth).toBe(2_898_005_731n)
+    })
+
+    it('reads a negative pool balance as no depth', async () => {
+      // Subgraph TVL tracking is known to drift negative; that is an accounting
+      // artifact rather than unreadable data, and the only honest reading of
+      // negative depth is none — which the floor downstream then refuses.
+      respondWith({
+        data: {
+          _meta: meta(),
+          pool: pool({ totalValueLockedToken1: '-0.000004' }),
+          swaps: [],
+        },
+      })
+
+      expect((await fetchSwaps(10)).poolUsdcDepth).toBe(0n)
+    })
+
+    it('refuses a pool balance it cannot read at all', async () => {
+      // Unlike a swap row there is nothing to fall back on: a depth guard cannot
+      // be judged without this figure.
+      respondWith({
+        data: {
+          _meta: meta(),
+          pool: pool({ totalValueLockedToken1: 'not-a-number' }),
+          swaps: [],
+        },
+      })
+
+      await expect(fetchSwaps(10)).rejects.toThrow(/unreadable pool USDC/)
+    })
+
     it('reports the indexer head and its error flag', async () => {
       respondWith({
         data: {
@@ -271,10 +312,10 @@ describe('priceOracle/subgraph', () => {
       respondWith({
         data: {
           _meta: meta(),
-          pool: {
+          pool: pool({
             token0: { id: USDC_ADDRESS.toLowerCase(), decimals: '6' },
             token1: { id: WAI3_ADDRESS.toLowerCase(), decimals: '18' },
-          },
+          }),
           swaps: [swap('1000.5', '-6.4032')],
         },
       })
@@ -289,10 +330,10 @@ describe('priceOracle/subgraph', () => {
       respondWith({
         data: {
           _meta: meta(),
-          pool: {
+          pool: pool({
             token0: { id: WAI3_ADDRESS.toLowerCase(), decimals: '9' },
             token1: { id: USDC_ADDRESS.toLowerCase(), decimals: '6' },
-          },
+          }),
           swaps: [],
         },
       })
@@ -448,6 +489,15 @@ describe('priceOracle/subgraph', () => {
           since: '1785800000',
         },
       })
+    })
+
+    it('asks for the depth field the liquidity floor judges', () => {
+      // The pool object is already queried for token identity, and depth is on
+      // it — so this costs no extra round trip. `totalValueLockedUSD` is on the
+      // same object and deliberately not used: it is a valuation derived through
+      // the subgraph's own pricing paths, the reason `amountUSD` is refused too.
+      expect(RECENT_SWAPS_QUERY).toMatch(/totalValueLockedToken1/)
+      expect(RECENT_SWAPS_QUERY).not.toMatch(/totalValueLockedUSD/)
     })
 
     it('selects the window by time, leaving the count as a cap', () => {

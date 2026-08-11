@@ -21,6 +21,9 @@ const MAX_WINDOW_SAMPLES = 1000
 const MAX_INDEX_LAG_MS = 900_000
 
 const PRICE = 6_400_000_000_000_000n // 0.0064 USD/AI3, scaled 1e18
+// The pool's real USDC balance on 2026-08-11, in base units — above the 1000 USDC
+// depth floor, having been at zero five days earlier.
+const POOL_DEPTH = 2_898_005_731n
 const BLOCK = 21_000_000n
 
 // A swap of 50,000 AI3 for 320 USDC — 0.0064 USD/AI3. Five of these clear the
@@ -81,6 +84,7 @@ const windowAt = (
     hasIndexingErrors?: boolean
     unparsedSwaps?: number
     truncated?: boolean
+    poolUsdcDepth?: bigint
   } = {},
 ) => ({
   samples: overrides.samples ?? swapsAt(5, now - 60_000),
@@ -89,6 +93,8 @@ const windowAt = (
   hasIndexingErrors: overrides.hasIndexingErrors ?? false,
   unparsedSwaps: overrides.unparsedSwaps ?? 0,
   truncated: overrides.truncated ?? false,
+  // What the pool actually held on 2026-08-11: 2898.005731 USDC.
+  poolUsdcDepth: overrides.poolUsdcDepth ?? POOL_DEPTH,
 })
 
 const mockWindow = (
@@ -531,6 +537,41 @@ describe('priceOracle.getPrice', () => {
       expect(await refusalReason()).toBe('thin-volume')
     })
 
+    it('refuses a pool that holds too little to be priced from', async () => {
+      // Volume is what traded and can be churned in a circle for the fee; depth
+      // has to be put there and left. The pool was at zero USDC on 2026-08-06,
+      // which is the state this refuses on.
+      mockWindow((now) => windowAt(now, { poolUsdcDepth: 0n }))
+
+      expect(await refusalReason()).toBe('thin-liquidity')
+    })
+
+    it('separates a shallow pool from a quiet one', async () => {
+      // Both are "the market is not there", and an operator needs to know which:
+      // one waits for LPs, the other for traders. Depth is judged first because it
+      // needs no sample at all.
+      mockWindow((now) =>
+        windowAt(now, { poolUsdcDepth: 0n, samples: swapsAt(1, now - 60_000) }),
+      )
+
+      expect(await refusalReason()).toBe('thin-liquidity')
+    })
+
+    it('judges the volume floor one-sided, so a round trip cannot count twice', async () => {
+      // Six fills that would total 1920 USDC — comfortably over the 1000 floor —
+      // but they are three buys and three sells of the same size, i.e. a round
+      // trip repeated. Capital committed is one side of that, and one side is 960.
+      mockWindow((now) => ({
+        ...windowAt(now),
+        samples: [
+          ...swapsAt(3, now - 60_000, USDC_PER_SWAP, 'buy'),
+          ...swapsAt(3, now - 60_000 - 3 * 3_600_000, USDC_PER_SWAP, 'sell'),
+        ],
+      }))
+
+      expect(await refusalReason()).toBe('thin-volume')
+    })
+
     it('refuses a price outside the sanity bounds', async () => {
       // 1000 USDC for 1 AI3 — above the 100 USD/AI3 ceiling.
       mockWindow((now) => ({
@@ -640,17 +681,19 @@ describe('priceOracle.getHealth', () => {
     mockWindow((now) => ({
       ...windowAt(now),
       samples: [
-        ...swapsAt(2, now - 60_000, USDC_PER_SWAP, 'buy'),
-        ...swapsAt(3, now - 60_000 - 2 * 3_600_000, USDC_PER_SWAP, 'sell'),
+        // Sized so the LARGER side clears the volume floor on its own, which is
+        // what that floor now judges.
+        ...swapsAt(3, now - 60_000, USDC_PER_SWAP, 'buy'),
+        ...swapsAt(4, now - 60_000 - 3 * 3_600_000, USDC_PER_SWAP, 'sell'),
       ],
     }))
 
     await priceOracle.getPrice()
 
     expect(priceOracle.getHealth().window).toMatchObject({
-      sampleCount: 5,
-      buyCount: 2,
-      sellCount: 3,
+      sampleCount: 7,
+      buyCount: 3,
+      sellCount: 4,
     })
   })
 

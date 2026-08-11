@@ -9,6 +9,7 @@ import {
   trimOutliers,
   volumeWeightedPrice,
   windowVolumeUsdc,
+  oneSidedVolumeUsdc,
 } from '../../../src/infrastructure/services/priceOracle/quote.js'
 import type { SwapSample } from '../../../src/infrastructure/services/priceOracle/types.js'
 
@@ -231,6 +232,46 @@ describe('priceOracle/quote', () => {
 
     it('is zero for an empty window', () => {
       expect(windowVolumeUsdc([])).toBe(0n)
+    })
+  })
+
+  describe('oneSidedVolumeUsdc', () => {
+    it('counts one side of a round trip, not both', () => {
+      // $6.40 in and $6.40 back out: the total says 12.80 traded, but 6.40 was
+      // committed and the net position is nothing. This is what makes a volume
+      // floor cheap to clear by churning — the fee on the churn is all it costs.
+      const roundTrip = [
+        swap(6.4, 1000, { direction: 'buy' }),
+        swap(6.4, 1000, { direction: 'sell' }),
+      ]
+
+      expect(windowVolumeUsdc(roundTrip)).toBe(12n * USDC + 800_000n)
+      expect(oneSidedVolumeUsdc(roundTrip)).toBe(6n * USDC + 400_000n)
+    })
+
+    it('takes the larger side', () => {
+      const samples = [
+        swap(3, 500, { direction: 'buy' }),
+        swap(2, 300, { direction: 'buy' }),
+        swap(4, 600, { direction: 'sell' }),
+      ]
+
+      expect(oneSidedVolumeUsdc(samples)).toBe(5n * USDC)
+    })
+
+    it('costs one-directional flow nothing', () => {
+      // Honest flow that only goes one way scores its full volume either way, so
+      // the tightening falls on churn rather than on traders.
+      const sells = [
+        swap(6, 1000, { direction: 'sell' }),
+        swap(4, 700, { direction: 'sell' }),
+      ]
+
+      expect(oneSidedVolumeUsdc(sells)).toBe(windowVolumeUsdc(sells))
+    })
+
+    it('is zero for an empty window', () => {
+      expect(oneSidedVolumeUsdc([])).toBe(0n)
     })
   })
 

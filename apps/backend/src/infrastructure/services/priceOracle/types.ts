@@ -82,8 +82,15 @@ export type SwapWindow = {
   buyCount: number
   sellCount: number
   // Total USDC base units traded across the surviving samples — the weight
-  // behind the average, and what makes it expensive to move.
+  // behind the average, and what an operator means by "how much traded".
   volumeUsdc: bigint
+  // The larger side's share of that, which is what the volume floor judges: a
+  // round trip inflates the total while committing capital once.
+  oneSidedVolumeUsdc: bigint
+  // USDC the pool held when the window was read. Not part of the window, but the
+  // fact that says whether it stands on anything — and the treasury report cannot
+  // size a conversion without it.
+  poolUsdcDepth: bigint
   // Span of the SURVIVING samples, not of everything fetched. Every field in
   // this struct describes the same set of fills, so an operator reading
   // "7 swaps over 4 days" is reading one consistent window rather than a count
@@ -132,8 +139,14 @@ export type OracleUnavailableReason =
   // A handful of swaps in one block is something anyone can print on demand;
   // a price held across hours is not.
   | 'narrow-window'
-  // The window traded too little for its average to mean anything.
+  // The window traded too little for its average to mean anything, measured on
+  // its larger side so a round trip cannot count twice.
   | 'thin-volume'
+  // The pool itself holds too little to be priced from, whatever its fills say.
+  // Distinct from `thin-volume` because volume can be churned in a circle for the
+  // fee while depth has to be deposited and left there — one is what traded, the
+  // other is what is standing behind it.
+  | 'thin-liquidity'
   // The derived price sits outside the configured sanity bounds.
   | 'out-of-bounds'
   // The indexer itself is behind; the window describes a past we cannot date.
