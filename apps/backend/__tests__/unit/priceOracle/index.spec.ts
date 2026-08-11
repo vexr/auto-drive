@@ -460,6 +460,22 @@ describe('priceOracle.getPrice', () => {
       expect(await refusalReason()).toBe('out-of-bounds')
     })
 
+    it('reports its own broken invariant as its own, not as an outage', async () => {
+      // A zero AI3 leg is impossible by the adapter's contract — it drops such
+      // rows — so if one arrives, the statistics throw. That is the oracle
+      // failing, and it must not be reported as `gateway`: one reason means wait
+      // for The Graph, the other means read the stack trace we just logged.
+      mockWindow((now) => ({
+        ...windowAt(now),
+        samples: swapsAt(5, now - 60_000).map((s) => ({
+          ...s,
+          ai3Amount: 0n,
+        })),
+      }))
+
+      expect(await refusalReason()).toBe('internal')
+    })
+
     it('does not cache or remember a refused window', async () => {
       mockWindow((now) => ({ ...windowAt(now), samples: swapsAt(4, now) }))
 

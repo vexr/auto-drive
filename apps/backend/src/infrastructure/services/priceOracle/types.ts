@@ -107,6 +107,12 @@ export type OracleUnavailableReason =
   // The indexer is current but reports that it failed to index something, so
   // what it served may be incomplete in ways we cannot see from here.
   | 'indexer-error'
+  // The ORACLE failed, not the market and not the source: an invariant its own
+  // statistics assert was violated. The only reason here whose answer is a stack
+  // trace rather than a wait or a redeploy, which is exactly why it is not
+  // folded into `gateway` — that sends whoever is paged to The Graph's status
+  // page to debug our bug.
+  | 'internal'
 
 /**
  * A snapshot of what the oracle currently knows, for the admin dashboard and

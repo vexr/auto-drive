@@ -427,6 +427,12 @@ const refresh = async (): Promise<
   // trusted. Without this, a violated invariant would reject `getPrice()`
   // instead of returning a typed error, and every concurrent caller sharing the
   // in-flight promise would get an unhandled rejection.
+  //
+  // Reported as `internal`, not `gateway`. What lands here is OUR invariant
+  // giving way — every upstream failure already has its own reason by this point
+  // — and the two demand opposite responses: `gateway` means wait, this means
+  // read the stack trace that was just logged. Labelling it `gateway` is the
+  // same misdiagnosis `misconfigured` was split out to prevent, one layer down.
   let window: Awaited<ReturnType<typeof buildWindow>>
   try {
     window = await internal.buildWindow()
@@ -435,8 +441,9 @@ const refresh = async (): Promise<
     logger.error(error, 'Price oracle: unexpected failure building the window')
     window = err(
       unavailable(
-        `unexpected failure building the window (${message})`,
-        'gateway',
+        `the oracle itself failed while building the window (${message}) — ` +
+          'this is a bug in the oracle, not a condition upstream',
+        'internal',
       ),
     )
   }
