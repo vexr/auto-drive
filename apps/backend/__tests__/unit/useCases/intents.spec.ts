@@ -14,6 +14,7 @@ import {
 } from '../../../src/errors/index.js'
 import {
   IntentStatus,
+  PaymentMethod,
   UserRole,
   type Account,
   type Intent,
@@ -218,6 +219,78 @@ describe('IntentsUseCases', () => {
     // createPurchasedCreditWithCapCheck, which uses `>`. A stricter pre-check
     // here would refuse purchases the real check would have granted.
     expect(result.isOk()).toBe(true)
+  })
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // createIntent — the size is required on the USDC path
+  //
+  // The asymmetry is the whole gate: optional on AI3 so the documented API-key
+  // flow keeps working, mandatory on USDC because that path cannot name an
+  // amount to charge without it. These pin both halves.
+  // ────────────────────────────────────────────────────────────────────────────
+
+  it('createIntent refuses a USDC intent with no requestedBytes', async () => {
+    const priceSpy = jest.spyOn(IntentsUseCases, 'getPrice')
+    const createSpy = jest.spyOn(intentsRepository, 'createIntent')
+
+    const result = await IntentsUseCases.createIntent(
+      orgUser,
+      undefined,
+      PaymentMethod.USDC_ETH,
+    )
+
+    expect(result.isErr()).toBe(true)
+    expect(result._unsafeUnwrapErr()).toBeInstanceOf(BadRequestError)
+    // Refused before pricing and before any row exists — a USDC intent without
+    // a size is unquotable, not merely incomplete.
+    expect(priceSpy).not.toHaveBeenCalled()
+    expect(createSpy).not.toHaveBeenCalled()
+  })
+
+  it('createIntent still allows an AI3 intent with no requestedBytes', async () => {
+    jest
+      .spyOn(intentsRepository, 'createIntent')
+      .mockImplementation(async (intent) => intent)
+
+    // The explicit default, spelled out: making the size mandatory on USDC must
+    // not make it mandatory on the path third-party API keys already call.
+    const result = await IntentsUseCases.createIntent(
+      orgUser,
+      undefined,
+      PaymentMethod.AI3_NATIVE,
+    )
+
+    expect(result.isOk()).toBe(true)
+  })
+
+  it('createIntent creates a USDC intent when a size is supplied', async () => {
+    mockPurchasedBalance(0n)
+    const createSpy = jest
+      .spyOn(intentsRepository, 'createIntent')
+      .mockImplementation(async (intent) => intent)
+
+    const result = await IntentsUseCases.createIntent(
+      orgUser,
+      1_073_741_824n,
+      PaymentMethod.USDC_ETH,
+    )
+
+    expect(result.isOk()).toBe(true)
+    // The method has to reach the row: it is what the payment manager routes on.
+    expect(createSpy.mock.calls[0][0].paymentMethod).toBe(PaymentMethod.USDC_ETH)
+  })
+
+  it('createIntent defaults an unspecified payment method to AI3', async () => {
+    const createSpy = jest
+      .spyOn(intentsRepository, 'createIntent')
+      .mockImplementation(async (intent) => intent)
+
+    const result = await IntentsUseCases.createIntent(orgUser)
+
+    expect(result.isOk()).toBe(true)
+    expect(createSpy.mock.calls[0][0].paymentMethod).toBe(
+      PaymentMethod.AI3_NATIVE,
+    )
   })
 
   // ────────────────────────────────────────────────────────────────────────────

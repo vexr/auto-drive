@@ -87,7 +87,7 @@ export const intents = {
                   requestedBytes: {
                     type: 'string',
                     description:
-                      'Optional. How many bytes the purchase is for, as a decimal string (a JSON number is also accepted while it is a safe integer). When supplied it is checked against the per-user credit cap before the intent is created, so a purchase with no headroom fails here rather than after an irreversible on-chain payment. It is not stored and does not appear on the returned intent: credits are derived from the amount actually paid, so it would never agree with the balance eventually granted.',
+                      'How many bytes the purchase is for, as a decimal string (a JSON number is also accepted while it is a safe integer). Optional when paying in AI3, where the intent locks a per-byte rate and any payment settles it; required when paying in USDC, where the amount charged is that rate times this size. When supplied it is checked against the per-user credit cap before the intent is created, so a purchase with no headroom fails here rather than after an irreversible on-chain payment. It is not stored and does not appear on the returned intent: credits are derived from the amount actually paid, so it would never agree with the balance eventually granted.',
                     example: '1073741824',
                   },
                 },
@@ -108,7 +108,7 @@ export const intents = {
           },
           '400': {
             description:
-              '`requestedBytes` was supplied but is not a positive whole number of bytes, or is larger than the per-account maximum',
+              '`requestedBytes` was supplied but is not a positive whole number of bytes, or is larger than the per-account maximum; or the intent is paid in USDC and no `requestedBytes` was supplied',
           },
           '401': {
             description: 'Unauthorized — missing or invalid credentials',

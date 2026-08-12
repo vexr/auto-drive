@@ -1,6 +1,7 @@
 import {
   Intent,
   IntentStatus,
+  PaymentMethod,
   User,
   UserRole,
   UserWithOrganization,
@@ -211,7 +212,37 @@ const checkCapHeadroom = async (
 const createIntent = async (
   executor: UserWithOrganization,
   requestedBytes?: bigint,
+  paymentMethod: PaymentMethod = PaymentMethod.AI3_NATIVE,
 ): Promise<Result<Intent, BadRequestError | CreditCapExceededError>> => {
+  // The USDC path cannot price a purchase without knowing its size, so the size
+  // is required there and optional on AI3.
+  //
+  // Not a stylistic asymmetry — the two paths owe different things at creation.
+  // An AI3 intent locks a per-byte rate and lets whatever arrives on-chain
+  // settle it, so it can be created without anyone having decided how much to
+  // buy. A USDC intent has to name a number the user is asked to transfer, and
+  // that number is the oracle's rate times the size: the rate prices ONE BYTE
+  // (a VWAP of realized fills, size-independent since #807), so without a size
+  // there is no amount to charge and nothing to put in quoted_token_amount.
+  //
+  // Enforced here rather than by making the field required on the endpoint,
+  // because `POST /intents` is a documented API-key flow for third-party
+  // integrators (see featureFlags.hasGoogleAuth) and every one of them is on
+  // AI3 today. Requiring it outright would break them to close a hole that only
+  // exists on a path they cannot reach.
+  if (
+    paymentMethod === PaymentMethod.USDC_ETH &&
+    requestedBytes === undefined
+  ) {
+    return err(
+      new BadRequestError(
+        'requestedBytes is required when paying in USDC: the amount charged ' +
+          'is the per-byte rate times the purchase size, so there is nothing ' +
+          'to quote without it',
+      ),
+    )
+  }
+
   // Validate and cap-check before getPrice(): that call goes over a WebSocket to
   // the consensus chain, and a request that is already invalid should not pay
   // for it.
@@ -253,6 +284,7 @@ const createIntent = async (
     id: randomBytes32(),
     userPublicId: executor.publicId,
     status: IntentStatus.PENDING,
+    paymentMethod,
     paymentAmount: undefined,
     shannonsPerByte: BigInt(price),
     // requestedBytes is deliberately not persisted. It exists to gate creation
