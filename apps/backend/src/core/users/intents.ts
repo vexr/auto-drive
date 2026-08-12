@@ -89,8 +89,10 @@ const DECIMAL_DIGITS = /^\d+$/
  * Absent (or an explicit null) means "no size given", which is a legitimate
  * request on the AI3 path: the create endpoint must keep accepting the body-less
  * calls the frontend makes today. It will not be legitimate on the USDC path,
- * where the size is what the pool is quoted for — that path has to require it,
- * which is a check for the caller rather than for this parser, whose job ends at
+ * where the size is what the charge is computed FROM: the oracle now reports a
+ * size-independent VWAP of realized fills (#746, landed in #807), so it prices a
+ * byte and the intent has to say how many. That path therefore has to require a
+ * size — a check for the caller rather than for this parser, whose job ends at
  * the wire shape.
  *
  * A decimal string is the canonical form. Every other size on an intent
