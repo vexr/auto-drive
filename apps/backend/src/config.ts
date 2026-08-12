@@ -197,18 +197,101 @@ export const config = {
     checkInterval: Number(env('EVM_CHAIN_CHECK_INTERVAL', '30000')),
     priceMultiplier: Number(env('CREDITS_PRICE_MULTIPLIER', '5.00')),
   },
+  // Ethereum mainnet. Distinct from `paymentManager.url`, which points at Auto
+  // EVM (chain 870) — two different chains, so keep the endpoints separate.
+  // Read directly (not via `env`) so it stays optional: a deployment that does
+  // not quote in USDC boots without it, and the consumer fails fast naming this
+  // variable the first time it is needed.
+  ethereum: {
+    rpcUrl: process.env.ETH_CHAIN_ENDPOINT,
+  },
   priceOracle: {
-    // AI3/USD price oracle (CoinGecko). See infrastructure/services/priceOracle.
-    // How long a freshly fetched price is served from memory before a refresh.
+    // AI3/USD price oracle: the volume-weighted average of the Uniswap WAI3/USDC
+    // pool's most recent swaps, read from the pool's published subgraph through
+    // The Graph's gateway. See infrastructure/services/priceOracle.
+    //
+    // Realized fills rather than pool state, because the treasury no longer
+    // swaps per intent — USDC accumulates and is converted manually — so what a
+    // purchase should be priced against is what the pool has actually been
+    // filling at, fee and impact included.
+    //
+    // Gateway endpoint for the subgraph, and the API key it is queried with.
+    // Both read directly (not via `env`) so they stay optional: a deployment
+    // that does not quote in USDC boots without them, and the oracle fails fast
+    // naming the missing variable the first time a rate is needed.
+    subgraphUrl: process.env.GRAPH_SUBGRAPH_URL,
+    graphApiKey: process.env.GRAPH_API_KEY,
+    // How long a freshly derived rate is served from memory before a refresh.
+    // Safe to cache, unlike the spot price this replaced: a minute cannot move
+    // an average built from days of fills.
     cacheTtlMs: positiveIntEnv('ORACLE_CACHE_TTL_MS', 60000),
-    // Longest a last-good price may be served as a fallback while CoinGecko is
-    // unavailable. Default: 10 minutes.
+    // Longest a last-good price may be served as a fallback while the window
+    // cannot be read. Default: 10 minutes.
     maxStaleMs: positiveIntEnv('ORACLE_MAX_STALE_MS', 600000),
-    // CoinGecko HTTP timeout.
-    fetchTimeoutMs: positiveIntEnv('ORACLE_FETCH_TIMEOUT_MS', 5000),
-    // Drop the quote if CoinGecko's own reported update time is older than this.
-    // Default: 5 minutes.
-    maxSourceAgeMs: positiveIntEnv('ORACLE_MAX_SOURCE_AGE_MS', 300000),
+    // Budget for the whole subgraph query, including connect and body read.
+    requestTimeoutMs: positiveIntEnv('ORACLE_REQUEST_TIMEOUT_MS', 10000),
+    // Cap on how many fills one query may return. NOT the window: the window is
+    // selected by time (ORACLE_MAX_WINDOW_AGE_MS, below) in the query itself,
+    // and this only bounds the response size.
+    //
+    // The distinction is the difference between an attacker having to out-trade
+    // the market and merely having to out-number a fixed slot count: fills
+    // selected by count, then filtered by age, let a burst EVICT history rather
+    // than compete with it, since filtering can only shrink the count and never
+    // reach past it. So this wants to sit far above any real week: the busiest
+    // 7 days in this pool's whole recorded history is 53 fills, against a
+    // default of 1000. A full page means the window may have been cut short and
+    // is refused rather than averaged, so raise this rather than lower it.
+    maxWindowSamples: positiveIntEnv('ORACLE_MAX_WINDOW_SAMPLES', 1000),
+    // Fewest swaps that may stand behind a rate, checked both on the raw window
+    // and again after the outlier trim. Below this the average is an anecdote.
+    minSwapSamples: positiveIntEnv('ORACLE_MIN_SWAP_SAMPLES', 5),
+    // Refuse to quote when the most recent swap is older than this: a window
+    // can be perfectly well-formed and still describe a market that has since
+    // stopped trading. Default: 24 hours.
+    maxSwapAgeMs: positiveIntEnv('ORACLE_MAX_SWAP_AGE_MS', 86400000),
+    // The window itself: fills older than this are not fetched, and cannot vote.
+    // It is what stops a majority of ancient fills from carrying the median — at
+    // which point the trim would discard the recent ones as outliers and the rate
+    // would come from another era — and, being applied at the source, it is also
+    // what makes the window a period rather than a slot count.
+    // Default: 7 days, which at this pool's ~1.6 swaps/day normally holds
+    // comfortably more than the ORACLE_MIN_SWAP_SAMPLES floor.
+    maxWindowAgeMs: positiveIntEnv('ORACLE_MAX_WINDOW_AGE_MS', 604800000),
+    // Least time the surviving fills must span. The outlier trim is count-based,
+    // so whoever supplies most of the window sets the price; requiring the
+    // window to have been HELD across time is what makes that expensive, since
+    // it must be defended against everyone else trading in between.
+    // Default: 2 hours.
+    minWindowSpanMs: positiveIntEnv('ORACLE_MIN_WINDOW_SPAN_MS', 7200000),
+    // Refuse to quote when the indexer's own head is older than this. Distinct
+    // from the swap-age guard on purpose — an indexer that has stalled and a
+    // pool that has gone quiet look identical in the data and need different
+    // responses. Default: 15 minutes.
+    maxIndexLagMs: positiveIntEnv('ORACLE_MAX_INDEX_LAG_MS', 900000),
+    // Least USDC (in whole USDC) the pool must actually HOLD for its fills to be
+    // priced from. Depth, not volume: volume is what traded and can be churned in
+    // a circle for the fee, while depth has to be put there and left. It is read
+    // from the pool's own USDC balance in the same query the swaps come from.
+    //
+    // Not unmanufacturable — a trader can raise it by buying, which hands the
+    // pool USDC and takes AI3 away — but that commits the whole amount as
+    // inventory at price risk plus a round trip's fees, against roughly 1% of
+    // nominal to churn the same figure in volume. An order of magnitude dearer,
+    // not a closed door. Default 1000 USDC, to be re-derived once this pool
+    // trades again: it held 2898 USDC on 2026-08-11, having been at zero five
+    // days earlier.
+    minPoolUsdcDepth: env('ORACLE_MIN_POOL_USDC_DEPTH', '1000'),
+    // Least USDC volume (in whole USDC) the surviving samples must total on their
+    // LARGER side. Judged one-sided rather than in total because a round trip
+    // contributes both legs while committing capital once, so a total is inflated
+    // by exactly the churn this floor exists to reject.
+    minWindowVolumeUsdc: env('ORACLE_MIN_WINDOW_VOLUME_USDC', '1000'),
+    // Drop swaps whose realized price deviates further than this (percent) from
+    // the window's median before averaging. Volume weighting alone does not
+    // cover a manipulating trade that is simply large — there, its weight is
+    // exactly what makes it dangerous.
+    maxSwapDeviationPercent: Number(env('ORACLE_MAX_SWAP_DEVIATION', '25')),
     // Sanity bounds (USD per AI3) as plain decimals — kept as raw strings and
     // parsed to the 1e18 scale in the priceOracle module (parsing the string
     // directly avoids Number.toString() exponential notation for small values).
