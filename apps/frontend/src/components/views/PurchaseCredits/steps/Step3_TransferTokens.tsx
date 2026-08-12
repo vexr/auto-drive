@@ -11,6 +11,7 @@ import { usePaymentIntent } from '../../../../hooks/usePaymentIntent';
 import { useNetwork } from '../../../../contexts/network';
 import { usePrices } from '../../../../hooks/usePrices';
 import { useTransactionConfirmation } from '../../../../hooks/useTransactionConfirmation';
+import { mibToBytes } from '../../../../utils/credits';
 
 export const PurchaseStep3TransferTokens = ({
   onNext,
@@ -27,6 +28,7 @@ export const PurchaseStep3TransferTokens = ({
   const publicClient = usePublicClient();
   const { formatCreditsInMbAsValue, formatCreditsInMbAsAi3 } = usePrices();
   const [intentId, setIntentId] = useState<string | undefined>(undefined);
+  const [intentError, setIntentError] = useState<string | undefined>(undefined);
 
   const { paymentIntent, targetContract, MINIMUM_CONFIRMATIONS } =
     usePaymentIntent();
@@ -64,9 +66,16 @@ export const PurchaseStep3TransferTokens = ({
   };
 
   const handleSend = useCallback(async () => {
+    setIntentError(undefined);
     try {
+      const sizeMib = Number(context.sizeMB);
       const depositTransaction = await paymentIntent(
-        formatCreditsInMbAsValue(Number(context.sizeMB)),
+        formatCreditsInMbAsValue(sizeMib),
+        // The same byte count the payment is priced from — formatCreditsInMbAsValue
+        // multiplies by exactly this before applying shannonsPerByte — so the
+        // size the cap is checked against is the size the payment will grant.
+        // sizeMB is whole MiB (inputToMib rounds), so this stays exact.
+        mibToBytes(sizeMib),
       );
       // Auto EVM is a Substrate-based network that does not support EIP-1559
       // fee history. Fetch the current gas price via eth_gasPrice and add a
@@ -85,7 +94,12 @@ export const PurchaseStep3TransferTokens = ({
       setTxHash(hash);
     } catch (error) {
       console.error('Error sending payment intent', error);
-      // no-op; UI will surface writeError via wagmi
+      // wagmi's writeError only covers the wallet call. A failure before that —
+      // now including a 403 when the purchase has no cap headroom left — has no
+      // other channel, and without this the button would appear to do nothing.
+      setIntentError(
+        error instanceof Error ? error.message : 'Could not start the payment',
+      );
     }
   }, [
     paymentIntent,
@@ -155,9 +169,11 @@ export const PurchaseStep3TransferTokens = ({
                 {isWriting ? 'Sending…' : 'Send Transfer'}
               </Button>
             </div>
-            {writeError && (
+            {(intentError || writeError) && (
               <div className='text-xs text-red-600'>
-                {writeError?.message || 'Missing deposit transaction'}
+                {intentError ||
+                  writeError?.message ||
+                  'Missing deposit transaction'}
               </div>
             )}
           </div>

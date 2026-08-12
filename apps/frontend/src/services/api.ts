@@ -117,7 +117,7 @@ export const createApiService = ({
   apiBaseUrl: string;
   downloadApiUrl: string;
 }) => ({
-  createIntent: async (): Promise<string> => {
+  createIntent: async (requestedBytes?: bigint): Promise<string> => {
     const session = await getAuthSession();
     if (!session?.authProvider || !session.accessToken) {
       throw new Error('No session');
@@ -133,11 +133,35 @@ export const createApiService = ({
         Authorization: `Bearer ${session.accessToken}`,
         'X-Auth-Provider': session.authProvider,
       },
-      body: JSON.stringify({ expiresAt }),
+      // As a decimal string: JSON.stringify cannot serialize a BigInt, and the
+      // backend takes the string form as canonical anyway.
+      body: JSON.stringify({
+        expiresAt,
+        ...(requestedBytes !== undefined && {
+          requestedBytes: requestedBytes.toString(),
+        }),
+      }),
     });
 
     if (!response.ok) {
-      throw new Error(`Network response was not ok: ${response.statusText}`);
+      // The cap rejection is the one failure here a user can act on, and it
+      // names the cap and their balance. Surfacing statusText instead would
+      // turn "you have 2 GiB of room left" into "Forbidden".
+      //
+      // Two body shapes, because the backend has two: errors carrying a
+      // machine-readable code send { error: CODE, message }, while the
+      // HttpError default sends { error: <the message> }. Preferring `message`
+      // and falling back to `error` reads the human-readable half of either.
+      const detail = await response
+        .json()
+        .then(
+          (body: { message?: string; error?: string }) =>
+            body?.message ?? body?.error,
+        )
+        .catch(() => undefined);
+      throw new Error(
+        detail ?? `Network response was not ok: ${response.statusText}`,
+      );
     }
 
     const intent = (await response.json()) as { id: string };

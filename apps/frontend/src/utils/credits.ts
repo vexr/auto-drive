@@ -4,6 +4,16 @@
  */
 
 /**
+ * Whole MiB to bytes.  The single conversion used both to decide locally
+ * whether a purchase fits under the cap and to tell the backend what size to
+ * check — the client's own verdict and the number the server re-checks must
+ * come from the same arithmetic, or a purchase can pass here and be rejected
+ * there.
+ */
+export const mibToBytes = (mib: number): bigint =>
+  BigInt(mib) * BigInt(1024 * 1024);
+
+/**
  * Returns true when `mib` whole MiB would exceed `maxPurchasableBytes`.
  * Always returns false when the cap is null (not yet loaded) or the value
  * is non-positive.  Shared by both the preset-package and custom-amount
@@ -14,8 +24,7 @@ export const isMibOverCap = (
   maxPurchasableBytes: bigint | null,
 ): boolean => {
   if (maxPurchasableBytes === null || mib <= 0) return false;
-  const bytes = BigInt(mib) * BigInt(1024 * 1024);
-  return bytes > maxPurchasableBytes;
+  return mibToBytes(mib) > maxPurchasableBytes;
 };
 
 /**
