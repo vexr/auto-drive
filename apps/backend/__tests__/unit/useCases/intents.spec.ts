@@ -143,8 +143,29 @@ describe('IntentsUseCases', () => {
     // The size gates creation and is then discarded. Persisting it would store a
     // number that reads like a balance and never agrees with one, since credits
     // come from paymentAmount / shannonsPerByte.
+    //
+    // The whole row is asserted, deliberately. The obvious spelling — checking
+    // that no key is named after the size — cannot fail: `Intent` has no size
+    // field, so TypeScript's excess-property check already rejects adding one
+    // to this object literal. What the compiler cannot catch is the size
+    // reaching the row under a field that DOES exist (`paymentAmount:
+    // requestedBytes`), and a value-based check catches that but only while no
+    // legitimate field happens to hold the same number — it would start failing
+    // spuriously the moment the mocked price became realistic.
+    //
+    // Pinning every field has neither weakness, and adds one the others lack:
+    // it fails when the row grows a field this test has not considered, which
+    // is exactly when someone should look at it again.
     const created = createSpy.mock.calls[0][0]
-    expect(Object.keys(created)).not.toContain('quotedBytes')
+    expect(created).toStrictEqual({
+      id: expect.any(String),
+      userPublicId: user.publicId,
+      status: IntentStatus.PENDING,
+      paymentMethod: PaymentMethod.AI3_NATIVE,
+      paymentAmount: undefined,
+      shannonsPerByte: 1n,
+      expiresAt: expect.any(Date),
+    })
   })
 
   it.each<[string, bigint]>([
